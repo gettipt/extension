@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "TIPT",
+  "version": "1.0.0",
+  "description": "A self-custodial bitcoin wallet for micropayments.",
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "TIPT - The Instant Payment Toolkit",
+    "default_icon": "asterisk.png"
+  },
+  "icons": {
+    "16": "asterisk.png",
+    "48": "asterisk.png",
+    "128": "asterisk.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "permissions": []
+}
