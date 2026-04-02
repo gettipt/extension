@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { SparkWallet } from '@buildonspark/spark-sdk'
 import { QRCodeSVG } from 'qrcode.react'
+import { FaGear } from 'react-icons/fa6'
 import {
   deriveKey, encryptText, decryptText, hexToBuf, bufToHex,
 } from './crypto'
@@ -21,6 +22,10 @@ type AppState =
 type PinSetupStep = 'enter' | 'confirm';
 type ActivePanel = 'send' | 'receive' | null;
 type SendStep = 'input' | 'amount' | 'sending' | 'success' | 'error';
+type PendingWalletAction =
+  | { type: 'create' }
+  | { type: 'recover'; mnemonic: string }
+  | null;
 
 interface WalletData {
   wallet: SparkWallet;
@@ -32,6 +37,7 @@ interface WalletData {
 const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
+const PIN_LENGTH = 4;
 
 function Spinner({ className = 'w-5 h-5' }: { className?: string }) {
   return (
@@ -47,17 +53,15 @@ function PinInput({
 }: {
   value: string;
   onChange: (v: string) => void;
-  onSubmit?: () => void;
+  onSubmit?: (v: string) => void;
   disabled?: boolean;
 }) {
   const r0 = useRef<HTMLInputElement>(null);
   const r1 = useRef<HTMLInputElement>(null);
   const r2 = useRef<HTMLInputElement>(null);
   const r3 = useRef<HTMLInputElement>(null);
-  const r4 = useRef<HTMLInputElement>(null);
-  const r5 = useRef<HTMLInputElement>(null);
-  const refs = [r0, r1, r2, r3, r4, r5];
-  const digits = value.split('').concat(Array(6).fill('')).slice(0, 6);
+  const refs = [r0, r1, r2, r3];
+  const digits = value.split('').concat(Array(PIN_LENGTH).fill('')).slice(0, PIN_LENGTH);
 
   const handleKey = (i: number, e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Backspace') {
@@ -65,8 +69,8 @@ function PinInput({
       const next = value.slice(0, i > 0 && digits[i] === '' ? i - 1 : i);
       onChange(next);
       refs[Math.max(0, digits[i] === '' ? i - 1 : i)]?.current?.focus();
-    } else if (e.key === 'Enter' && value.length === 6) {
-      onSubmit?.();
+    } else if (e.key === 'Enter' && value.length === PIN_LENGTH) {
+      onSubmit?.(value);
     }
   };
 
@@ -75,10 +79,10 @@ function PinInput({
     if (!d) return;
     const arr = digits.slice();
     arr[i] = d;
-    const next = arr.join('').slice(0, 6);
+    const next = arr.join('').slice(0, PIN_LENGTH);
     onChange(next);
-    if (i < 5) refs[i + 1]?.current?.focus();
-    else if (next.length === 6) onSubmit?.();
+    if (i < PIN_LENGTH - 1) refs[i + 1]?.current?.focus();
+    else if (next.length === PIN_LENGTH) onSubmit?.(next);
   };
 
   return (
@@ -94,7 +98,8 @@ function PinInput({
           onChange={(e) => handleChange(i, e)}
           onKeyDown={(e) => handleKey(i, e)}
           disabled={disabled}
-          className="w-10 h-12 text-center text-lg font-mono rounded-lg border border-gray-700 bg-neutral-800 text-white focus:outline-none focus:border-orange-500 disabled:opacity-50 caret-transparent"
+          autoFocus={i === 0}
+          className="w-10 h-12 text-center text-lg font-mono rounded-lg border border-neutral-300 bg-neutral-100 text-neutral-900 focus:outline-none focus:border-neutral-500 disabled:opacity-50 caret-transparent dark:border-gray-700 dark:bg-neutral-800 dark:text-white dark:focus:border-neutral-400"
         />
       ))}
     </div>
@@ -112,7 +117,7 @@ function CopyButton({ text }: { text: string }) {
   return (
     <button
       onClick={copy}
-      className="px-2 py-1 text-xs rounded border border-gray-700 text-neutral-400 hover:text-white hover:border-gray-500 transition-colors"
+      className="px-2 py-1 text-xs rounded border border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-white dark:hover:border-gray-500"
     >
       {copied ? 'Copied!' : 'Copy'}
     </button>
@@ -123,7 +128,6 @@ export default function App() {
   const [appState, setAppState] = useState<AppState>('initializing');
   const [walletError, setWalletError] = useState<string | null>(null);
 
-  const [pinKey, setPinKey] = useState<CryptoKey | null>(null);
   const [pinInput, setPinInput] = useState('');
   const [pinConfirm, setPinConfirm] = useState('');
   const [pinSetupStep, setPinSetupStep] = useState<PinSetupStep>('enter');
@@ -131,7 +135,7 @@ export default function App() {
   const [pinLoading, setPinLoading] = useState(false);
 
   const [walletData, setWalletData] = useState<WalletData | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const [btcUsdRate, setBtcUsdRate] = useState<number | null>(null);
   const [recoverInput, setRecoverInput] = useState('');
   const [showRecover, setShowRecover] = useState(false);
 
@@ -147,15 +151,40 @@ export default function App() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
   const [sendTxId, setSendTxId] = useState<string | null>(null);
+  const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
+  const [showSettingsMenu, setShowSettingsMenu] = useState(false);
+  const [showRecoverySeed, setShowRecoverySeed] = useState(false);
 
   useEffect(() => {
-    const pinData = localStorage.getItem(PIN_KEY);
-    setAppState(pinData ? 'pin-lock' : 'pin-setup');
+    const walletData = localStorage.getItem(WALLET_KEY);
+    setAppState(walletData ? 'pin-lock' : 'idle');
   }, []);
 
   useEffect(() => () => {
     if (pollRef.current) clearInterval(pollRef.current);
   }, []);
+
+  const refreshBtcUsdRate = useCallback(async () => {
+    try {
+      const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
+      if (!response.ok) return;
+      const data = await response.json() as { bitcoin?: { usd?: number } };
+      const nextRate = data.bitcoin?.usd;
+      if (typeof nextRate === 'number' && Number.isFinite(nextRate)) {
+        setBtcUsdRate(nextRate);
+      }
+    } catch {
+      // Ignore transient pricing errors and keep the last known rate.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshBtcUsdRate();
+    const timer = setInterval(() => {
+      void refreshBtcUsdRate();
+    }, 300000);
+    return () => clearInterval(timer);
+  }, [refreshBtcUsdRate]);
 
   const startPolling = useCallback((wallet: SparkWallet) => {
     if (pollRef.current) clearInterval(pollRef.current);
@@ -163,7 +192,6 @@ export default function App() {
       try {
         const balance = await wallet.getBalance();
         setWalletData((prev) => prev ? { ...prev, balanceSats: balance.balance } : prev);
-        setLastUpdated(new Date().toLocaleTimeString());
       } catch { }
     }, 5000);
   }, []);
@@ -187,7 +215,6 @@ export default function App() {
       setActivePanel(null);
       setInvoice(null);
       setAppState('ready');
-      setLastUpdated(new Date().toLocaleTimeString());
       startPolling(wallet);
     } catch (err) {
       setWalletError(err instanceof Error ? err.message : String(err));
@@ -209,16 +236,16 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handlePinSetupNext = () => {
-    if (pinInput.length < 6) { setPinError('PIN must be exactly 6 digits.'); return; }
+  const handlePinSetupNext = (pin = pinInput) => {
+    if (pin.length < PIN_LENGTH) { setPinError('PIN must be exactly 4 digits.'); return; }
     setPinSetupStep('confirm');
     setPinConfirm('');
     setPinError(null);
   };
 
-  const handlePinSetupConfirm = async () => {
-    if (pinConfirm.length < 6) return;
-    if (pinConfirm !== pinInput) {
+  const handlePinSetupConfirm = async (confirmPin = pinConfirm) => {
+    if (confirmPin.length < PIN_LENGTH) return;
+    if (confirmPin !== pinInput) {
       setPinError('PINs do not match. Try again.');
       setPinConfirm('');
       return;
@@ -230,11 +257,20 @@ export default function App() {
       const key = await deriveKey(pinInput, salt);
       const verifier = await encryptText(key, SENTINEL);
       localStorage.setItem(PIN_KEY, JSON.stringify({ salt: bufToHex(salt), verifier }));
-      setPinKey(key);
       setPinInput('');
       setPinConfirm('');
       setPinSetupStep('enter');
-      await afterUnlock(key);
+      if (pendingWalletAction?.type === 'create') {
+        setPendingWalletAction(null);
+        setAppState('creating');
+        await doInitWallet(undefined, key, false);
+      } else if (pendingWalletAction?.type === 'recover') {
+        setPendingWalletAction(null);
+        setAppState('recovering');
+        await doInitWallet(pendingWalletAction.mnemonic, key, true);
+      } else {
+        await afterUnlock(key);
+      }
     } catch {
       setPinError('Failed to set up PIN. Please try again.');
     } finally {
@@ -242,18 +278,17 @@ export default function App() {
     }
   };
 
-  const handlePinUnlock = async () => {
-    if (pinInput.length < 6) return;
+  const handlePinUnlock = async (pin = pinInput) => {
+    if (pin.length < PIN_LENGTH) return;
     setPinLoading(true);
     setPinError(null);
     try {
       const pinRaw = localStorage.getItem(PIN_KEY);
       if (!pinRaw) throw new Error('No PIN stored.');
       const { salt, verifier } = JSON.parse(pinRaw);
-      const key = await deriveKey(pinInput, hexToBuf(salt));
+      const key = await deriveKey(pin, hexToBuf(salt));
       const result = await decryptText(key, verifier.iv, verifier.ct);
       if (result !== SENTINEL) throw new Error('Wrong PIN.');
-      setPinKey(key);
       setPinInput('');
       await afterUnlock(key);
     } catch {
@@ -264,20 +299,14 @@ export default function App() {
     }
   };
 
-  const initWallet = async (mnemonicOrSeed?: string) => {
-    if (!pinKey) return;
-    setAppState(mnemonicOrSeed ? 'recovering' : 'creating');
-    setWalletError(null);
-    await doInitWallet(mnemonicOrSeed, pinKey, !!mnemonicOrSeed);
-  };
-
   const handleLock = () => {
     if (pollRef.current) clearInterval(pollRef.current);
     setWalletData(null);
-    setPinKey(null);
     setPinInput('');
     setPinError(null);
     setActivePanel(null);
+    setShowSettingsMenu(false);
+    setShowRecoverySeed(false);
     setAppState('pin-lock');
   };
 
@@ -351,7 +380,6 @@ export default function App() {
       setSendStep('success');
       const balance = await walletData.wallet.getBalance();
       setWalletData((prev) => prev ? { ...prev, balanceSats: balance.balance } : prev);
-      setLastUpdated(new Date().toLocaleTimeString());
     } catch (err) {
       setSendError(err instanceof Error ? err.message : String(err));
       setSendStep('error');
@@ -364,42 +392,53 @@ export default function App() {
   const maxSats = lnurlPayInfo ? Math.floor(lnurlPayInfo.maxSendableMsats / 1000) : undefined;
   const amountNum = parseInt(sendAmountSats, 10);
   const amountValid = !isNaN(amountNum) && amountNum >= minSats && (maxSats === undefined || amountNum <= maxSats);
+  const usdBalance = walletData && btcUsdRate !== null
+    ? (Number(walletData.balanceSats) / 100000000) * btcUsdRate
+    : null;
 
   return (
-    <div className="w-[360px] max-h-[600px] overflow-y-auto bg-neutral-950 text-neutral-100 flex flex-col p-4">
+    <div className="w-[360px] max-h-[600px] overflow-y-auto bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
 
-      <div className="mb-5">
-        <h1 className="text-lg font-bold text-white">TIPT</h1>
-        <p className="text-neutral-500 text-xs">the instant payment toolkit</p>
-      </div>
+      {['creating', 'recovering', 'error'].includes(appState) && (
+        <div className="mb-5">
+          <h1 className="text-lg font-bold text-neutral-900 dark:text-white">TIPT</h1>
+          <p className="text-neutral-500 text-xs">the instant payment toolkit</p>
+        </div>
+      )}
 
       {appState === 'initializing' && (
-        <div className="flex justify-center py-8">
-          <Spinner className="w-6 h-6 text-orange-400" />
+        <div className="flex flex-col items-center gap-4 py-8">
+          <img src="/asterisk.png" alt="TIPT" className="w-12 h-12" />
+          <Spinner className="w-6 h-6 text-neutral-400" />
         </div>
       )}
 
       {appState === 'pin-setup' && (
-        <div className="space-y-4 p-4 rounded-xl bg-neutral-900 border border-gray-800">
+        <div className="space-y-4 p-4">
           <div className="text-center">
-            <h2 className="text-sm font-semibold text-white">
+            <img src="/asterisk.png" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">
               {pinSetupStep === 'enter' ? 'Create a PIN' : 'Confirm your PIN'}
             </h2>
             <p className="text-xs text-neutral-500 mt-1">
-              {pinSetupStep === 'enter' ? 'Choose a 6-digit PIN to protect your wallet.' : 'Re-enter your PIN to confirm.'}
+              {pinSetupStep === 'enter' ? 'Choose a 4-digit PIN for your new wallet.' : 'Re-enter your PIN to confirm.'}
             </p>
           </div>
           <PinInput
+            key={pinSetupStep}
             value={pinSetupStep === 'enter' ? pinInput : pinConfirm}
             onChange={pinSetupStep === 'enter' ? setPinInput : setPinConfirm}
             onSubmit={pinSetupStep === 'enter' ? handlePinSetupNext : handlePinSetupConfirm}
             disabled={pinLoading}
           />
-          {pinError && <p className="text-center text-xs text-red-400">{pinError}</p>}
+          {pinError && <p className="text-center text-xs text-neutral-500 dark:text-neutral-400">{pinError}</p>}
           <button
-            onClick={pinSetupStep === 'enter' ? handlePinSetupNext : handlePinSetupConfirm}
-            disabled={pinLoading || (pinSetupStep === 'enter' ? pinInput.length < 6 : pinConfirm.length < 6)}
-            className="w-full py-2.5 text-sm font-semibold rounded-xl bg-orange-500 text-white hover:bg-orange-400 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2"
+            onClick={() => {
+              if (pinSetupStep === 'enter') handlePinSetupNext();
+              else void handlePinSetupConfirm();
+            }}
+            disabled={pinLoading || (pinSetupStep === 'enter' ? pinInput.length < PIN_LENGTH : pinConfirm.length < PIN_LENGTH)}
+            className="w-full py-2.5 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2 dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
           >
             {pinLoading ? (<><Spinner className="w-4 h-4" /> Setting up...</>) : pinSetupStep === 'enter' ? 'Next' : 'Confirm PIN'}
           </button>
@@ -412,17 +451,18 @@ export default function App() {
       )}
 
       {appState === 'pin-lock' && (
-        <div className="space-y-4 p-4 rounded-xl bg-neutral-900 border border-gray-800">
+        <div className="space-y-4 p-4">
           <div className="text-center">
-            <h2 className="text-sm font-semibold text-white">Enter your PIN</h2>
+            <img src="/asterisk.png" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Enter your PIN</h2>
             <p className="text-xs text-neutral-500 mt-1">Your wallet is locked.</p>
           </div>
           <PinInput value={pinInput} onChange={setPinInput} onSubmit={handlePinUnlock} disabled={pinLoading} />
-          {pinError && <p className="text-center text-xs text-red-400">{pinError}</p>}
+          {pinError && <p className="text-center text-xs text-neutral-500 dark:text-neutral-400">{pinError}</p>}
           <button
-            onClick={handlePinUnlock}
-            disabled={pinLoading || pinInput.length < 6}
-            className="w-full py-2.5 text-sm font-semibold rounded-xl bg-orange-500 text-white hover:bg-orange-400 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2"
+            onClick={() => { void handlePinUnlock(); }}
+            disabled={pinLoading || pinInput.length < PIN_LENGTH}
+            className="w-full py-2.5 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2 dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
           >
             {pinLoading ? (<><Spinner className="w-4 h-4" /> Unlocking...</>) : 'Unlock'}
           </button>
@@ -431,8 +471,8 @@ export default function App() {
 
       {isLoading && (
         <div className="flex justify-center py-6">
-          <div className="inline-flex items-center gap-3 px-5 py-3 rounded-xl bg-neutral-900 border border-gray-800">
-            <Spinner className="w-5 h-5 text-orange-400" />
+          <div className="inline-flex items-center gap-3 px-5 py-3 rounded-xl bg-neutral-100 border border-neutral-200 dark:bg-neutral-900 dark:border-gray-800">
+            <Spinner className="w-5 h-5 text-neutral-400" />
             <span className="text-neutral-300 text-sm">{appState === 'recovering' ? 'Recovering wallet...' : 'Creating wallet...'}</span>
           </div>
         </div>
@@ -440,117 +480,143 @@ export default function App() {
 
       {appState === 'error' && (
         <div className="space-y-3 text-center">
-          <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400">
+          <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-300 text-neutral-700 dark:bg-neutral-800/50 dark:border-neutral-600/30 dark:text-neutral-300">
             <p className="font-semibold text-sm mb-1">Something went wrong</p>
             <p className="text-xs font-mono break-all">{walletError}</p>
           </div>
-          <button onClick={() => setAppState('idle')} className="px-5 py-2.5 text-sm font-semibold rounded-xl bg-orange-500 text-white hover:bg-orange-400 transition-colors">
+          <button onClick={() => setAppState('idle')} className="px-5 py-2.5 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100">
             Try Again
           </button>
         </div>
       )}
 
       {appState === 'idle' && (
-        <div className="space-y-3">
-          <div className="p-4 rounded-xl bg-neutral-900 border border-gray-800 text-center">
-            <p className="text-neutral-400 text-xs mb-3">Generate a new wallet with a fresh recovery phrase.</p>
-            <button onClick={() => initWallet()} className="w-full py-3 text-sm font-semibold rounded-xl bg-orange-500 text-white hover:bg-orange-400 active:bg-orange-600 transition-colors">
-              Create Wallet
-            </button>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="flex-1 h-px bg-neutral-800" />
-            <span className="text-xs text-neutral-600">or</span>
-            <div className="flex-1 h-px bg-neutral-800" />
-          </div>
-          <div className="p-4 rounded-xl bg-neutral-900 border border-gray-800">
-            {!showRecover ? (
-              <div className="text-center">
-                <p className="text-neutral-400 text-xs mb-3">Already have a wallet? Restore using your recovery phrase.</p>
-                <button onClick={() => setShowRecover(true)} className="w-full py-2.5 text-sm font-semibold rounded-xl border border-gray-700 text-neutral-200 hover:border-gray-500 hover:bg-neutral-800 transition-colors">
-                  Recover Wallet
+        <div className="space-y-4 py-6">
+          <img src="/asterisk.png" alt="TIPT" className="w-14 h-14 mx-auto" />
+          {!showRecover ? (
+            <>
+              <button onClick={() => {
+                setPendingWalletAction({ type: 'create' });
+                setPinInput('');
+                setPinConfirm('');
+                setPinError(null);
+                setPinSetupStep('enter');
+                setAppState('pin-setup');
+              }} className="w-full py-3 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 active:bg-neutral-950 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 dark:active:bg-neutral-300">
+                Create Wallet
+              </button>
+              <button onClick={() => setShowRecover(true)} className="w-full py-2.5 text-sm font-semibold rounded-xl border border-neutral-300 text-neutral-700 hover:border-neutral-400 hover:bg-neutral-100 transition-colors dark:border-gray-700 dark:text-neutral-200 dark:hover:border-gray-500 dark:hover:bg-neutral-800">
+                Recover Wallet
+              </button>
+              <a href="#" onClick={(e) => e.preventDefault()} className="block w-full text-center text-xs text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
+                Setup Instructions
+              </a>
+            </>
+          ) : (
+            <div className="space-y-3">
+              <textarea
+                value={recoverInput}
+                onChange={(e) => setRecoverInput(e.target.value)}
+                placeholder="Enter your 12 or 24 word recovery phrase..."
+                rows={3}
+                className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+              />
+              <div className="flex gap-2">
+                <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:border-gray-600 dark:hover:text-neutral-200">
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    const t = recoverInput.trim();
+                    if (!t) return;
+                    setPendingWalletAction({ type: 'recover', mnemonic: t });
+                    setShowRecover(false);
+                    setRecoverInput('');
+                    setPinInput('');
+                    setPinConfirm('');
+                    setPinError(null);
+                    setPinSetupStep('enter');
+                    setAppState('pin-setup');
+                  }}
+                  disabled={!recoverInput.trim()}
+                  className="flex-1 py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+                >
+                  Recover
                 </button>
               </div>
-            ) : (
-              <div className="space-y-3">
-                <label className="block text-xs font-semibold text-neutral-300">Recovery Phrase</label>
-                <textarea
-                  value={recoverInput}
-                  onChange={(e) => setRecoverInput(e.target.value)}
-                  placeholder="Enter your 12 or 24 word recovery phrase..."
-                  rows={3}
-                  className="w-full px-3 py-2 rounded-lg bg-neutral-800 border border-gray-700 text-xs text-neutral-200 placeholder-neutral-600 font-mono resize-none focus:outline-none focus:border-orange-500/50"
-                />
-                <div className="flex gap-2">
-                  <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-gray-700 text-neutral-400 hover:border-gray-600 hover:text-neutral-200 transition-colors">
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => { const t = recoverInput.trim(); if (t) initWallet(t); }}
-                    disabled={!recoverInput.trim()}
-                    className="flex-1 py-2 text-xs font-semibold rounded-lg bg-orange-500 text-white hover:bg-orange-400 disabled:opacity-40 disabled:pointer-events-none transition-colors"
-                  >
-                    Recover
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
 
       {appState === 'ready' && walletData && (
         <div className="space-y-3">
-          <div className="p-4 rounded-xl bg-neutral-900 border border-gray-800 flex items-center justify-between">
-            <div>
-              <p className="text-xs text-neutral-500 mb-0.5">Balance</p>
-              <div className="flex items-baseline gap-1">
-                <span className="text-xl text-orange-400 font-bold">&#8383;</span>
-                <span className="text-xl font-bold text-white">{walletData.balanceSats.toString()}</span>
-                <span className="text-xs text-neutral-500 ml-1">sats</span>
-              </div>
-              {lastUpdated && (
-                <div className="flex items-center gap-1 mt-1">
-                  <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                  <span className="text-xs text-neutral-600">Updated {lastUpdated}</span>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <img src="/asterisk.png" alt="TIPT" className="w-7 h-7" />
+              <h1 className="text-lg font-bold text-neutral-900 dark:text-white">TIPT</h1>
+            </div>
+            <div className="relative">
+              <button
+                onClick={() => setShowSettingsMenu((v) => !v)}
+                title="Settings"
+                className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
+              >
+                <FaGear className="w-4 h-4" />
+              </button>
+              {showSettingsMenu && (
+                <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
+                  <div className="flex flex-col items-start gap-1">
+                    <button
+                      onClick={() => {
+                        setShowRecoverySeed(true);
+                        setShowSettingsMenu(false);
+                      }}
+                      className="text-xs text-neutral-700 hover:text-neutral-900 underline underline-offset-2 dark:text-neutral-300 dark:hover:text-white"
+                    >
+                      Recovery Seed
+                    </button>
+                    <button
+                      onClick={handleLock}
+                      className="text-xs text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
+                    >
+                      Lock Wallet
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
-            <button onClick={handleLock} title="Lock wallet" className="p-1.5 rounded-lg text-neutral-600 hover:text-neutral-300 hover:bg-neutral-800 transition-colors">
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z" />
-              </svg>
-            </button>
+          </div>
+
+          <div className="p-4 rounded-xl bg-neutral-100 dark:bg-neutral-900">
+            <p className="text-xs text-neutral-500 mb-0.5">Balance</p>
+            <div className="flex items-baseline gap-1">
+              <span className="text-4xl text-neutral-600 font-bold dark:text-neutral-300">&#8383;</span>
+              <span className="text-4xl font-bold text-neutral-900 dark:text-white">{walletData.balanceSats.toString()}</span>
+            </div>
+            <p className="text-xs text-neutral-600 mt-1">
+              USD {usdBalance === null ? '--' : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-2">
             <button
               onClick={handleSend}
-              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-orange-500/10 border-orange-500/40 text-orange-400' : 'bg-neutral-900 border-gray-800 text-neutral-400 hover:border-gray-700 hover:text-neutral-200'}`}
+              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
             >
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center ${activePanel === 'send' ? 'bg-orange-500/20' : 'bg-neutral-800'}`}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5L12 3m0 0l7.5 7.5M12 3v18" />
-                </svg>
-              </div>
-              <span className="text-xs font-semibold">Send</span>
+              <span className="text-md font-semibold">Send</span>
             </button>
             <button
               onClick={handleReceive}
-              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-orange-500/10 border-orange-500/40 text-orange-400' : 'bg-neutral-900 border-gray-800 text-neutral-400 hover:border-gray-700 hover:text-neutral-200'}`}
+              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
             >
-              <div className={`w-8 h-8 rounded-full flex items-center justify-center ${activePanel === 'receive' ? 'bg-orange-500/20' : 'bg-neutral-800'}`}>
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 13.5L12 21m0 0l-7.5-7.5M12 21V3" />
-                </svg>
-              </div>
-              <span className="text-xs font-semibold">Receive</span>
+              <span className="text-md font-semibold">Receive</span>
             </button>
           </div>
 
           {activePanel === 'send' && (
-            <div className="p-4 rounded-xl bg-neutral-900 border border-gray-800 space-y-3">
-              <p className="text-xs font-semibold text-neutral-200">Send via Lightning Address / LNURL</p>
+            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
+              <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Send via Lightning Address / LNURL</p>
 
               {sendStep === 'input' && (
                 <div className="space-y-2">
@@ -560,13 +626,13 @@ export default function App() {
                     onChange={(e) => setSendInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
                     placeholder="user@domain.com or lnurl1..."
-                    className="w-full px-3 py-2 rounded-lg bg-neutral-800 border border-gray-700 text-xs text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-orange-500/50"
+                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
                   />
-                  {sendError && <p className="text-xs text-red-400">{sendError}</p>}
+                  {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
                   <button
                     onClick={handleResolveLnurl}
                     disabled={!sendInput.trim() || resolving}
-                    className="w-full py-2 text-xs font-semibold rounded-lg bg-orange-500 text-white hover:bg-orange-400 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2"
+                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2 dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
                   >
                     {resolving ? (<><Spinner className="w-3.5 h-3.5" /> Resolving...</>) : 'Continue'}
                   </button>
@@ -576,9 +642,9 @@ export default function App() {
               {sendStep === 'amount' && lnurlPayInfo && (
                 <div className="space-y-2">
                   {lnurlPayInfo.description && (
-                    <div className="px-3 py-2 rounded-lg bg-neutral-800/60 border border-gray-700/50">
+                    <div className="px-3 py-2 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-gray-700/50">
                       <p className="text-xs text-neutral-500 mb-0.5">Paying to</p>
-                      <p className="text-xs text-neutral-200">{lnurlPayInfo.description}</p>
+                      <p className="text-xs text-neutral-700 dark:text-neutral-200">{lnurlPayInfo.description}</p>
                     </div>
                   )}
                   <div>
@@ -589,18 +655,18 @@ export default function App() {
                       type="number"
                       value={sendAmountSats}
                       onChange={(e) => setSendAmountSats(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-neutral-800 border border-gray-700 text-xs text-neutral-200 focus:outline-none focus:border-orange-500/50"
+                      className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
                     />
                   </div>
-                  {sendError && <p className="text-xs text-red-400">{sendError}</p>}
+                  {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
                   <div className="flex gap-2">
-                    <button onClick={() => { setSendStep('input'); setLnurlPayInfo(null); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-gray-700 text-neutral-400 hover:border-gray-600 hover:text-neutral-200 transition-colors">
+                    <button onClick={() => { setSendStep('input'); setLnurlPayInfo(null); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:border-gray-600 dark:hover:text-neutral-200">
                       Back
                     </button>
                     <button
                       onClick={handleSendPayment}
                       disabled={!amountValid}
-                      className="flex-1 py-2 text-xs font-semibold rounded-lg bg-orange-500 text-white hover:bg-orange-400 disabled:opacity-40 disabled:pointer-events-none transition-colors"
+                      className="flex-1 py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
                     >
                       Pay {sendAmountSats} sats
                     </button>
@@ -610,25 +676,25 @@ export default function App() {
 
               {sendStep === 'sending' && (
                 <div className="flex items-center justify-center py-4 gap-2 text-neutral-400">
-                  <Spinner className="w-4 h-4 text-orange-400" />
+                  <Spinner className="w-4 h-4 text-neutral-400" />
                   <span className="text-xs">Sending payment...</span>
                 </div>
               )}
 
               {sendStep === 'success' && (
                 <div className="space-y-2">
-                  <div className="flex items-center gap-3 p-3 rounded-lg bg-green-500/10 border border-green-500/30">
-                    <div className="w-7 h-7 rounded-full bg-green-500/20 flex items-center justify-center shrink-0">
-                      <svg className="w-3.5 h-3.5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <div className="flex items-center gap-3 p-3 rounded-lg bg-neutral-100 border border-neutral-300 dark:bg-neutral-800/50 dark:border-neutral-600/50">
+                    <div className="w-7 h-7 rounded-full bg-neutral-200 flex items-center justify-center shrink-0 dark:bg-neutral-700">
+                      <svg className="w-3.5 h-3.5 text-neutral-600 dark:text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
                       </svg>
                     </div>
                     <div>
-                      <p className="text-xs font-semibold text-green-300">Payment sent!</p>
+                      <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Payment sent!</p>
                       {sendTxId && <p className="text-xs text-neutral-500 font-mono break-all mt-0.5">{sendTxId}</p>}
                     </div>
                   </div>
-                  <button onClick={handleSend} className="w-full py-2 text-xs font-medium rounded-lg border border-gray-700 text-neutral-400 hover:text-neutral-200 hover:border-gray-600 transition-colors">
+                  <button onClick={handleSend} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-gray-600">
                     Send another
                   </button>
                 </div>
@@ -636,8 +702,8 @@ export default function App() {
 
               {sendStep === 'error' && (
                 <div className="space-y-2">
-                  <div className="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs">{sendError}</div>
-                  <button onClick={() => { setSendStep('amount'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-gray-700 text-neutral-400 hover:text-neutral-200 hover:border-gray-600 transition-colors">
+                  <div className="p-3 rounded-lg bg-neutral-100 border border-neutral-300 text-neutral-600 text-xs dark:bg-neutral-800/50 dark:border-neutral-600/30 dark:text-neutral-400">{sendError}</div>
+                  <button onClick={() => { setSendStep('amount'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-gray-600">
                     Try Again
                   </button>
                 </div>
@@ -646,14 +712,14 @@ export default function App() {
           )}
 
           {activePanel === 'receive' && (
-            <div className="p-4 rounded-xl bg-neutral-900 border border-gray-800 space-y-3">
+            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-neutral-200">Lightning Invoice</span>
+                <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Lightning Invoice</span>
                 {invoice && <CopyButton text={invoice} />}
               </div>
               {fetchingInvoice ? (
                 <div className="flex items-center justify-center py-8 gap-2 text-neutral-500">
-                  <Spinner className="w-4 h-4 text-orange-400" />
+                  <Spinner className="w-4 h-4 text-neutral-400" />
                   <span className="text-xs">Generating invoice...</span>
                 </div>
               ) : invoice ? (
@@ -663,34 +729,44 @@ export default function App() {
                       <QRCodeSVG value={invoice} size={160} level="M" />
                     </div>
                   </div>
-                  <div className="p-2.5 rounded-lg bg-neutral-800/60 border border-gray-700/50">
-                    <p className="text-xs font-mono text-neutral-400 break-all leading-relaxed">{invoice}</p>
+                  <div className="p-2.5 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-gray-700/50">
+                    <p className="text-xs font-mono text-neutral-600 break-all leading-relaxed dark:text-neutral-400">{invoice}</p>
                   </div>
                   <p className="text-xs text-neutral-600 text-center">Scan or share — payer chooses the amount.</p>
                 </>
               ) : (
-                <p className="text-xs text-red-400 text-center">Failed to generate invoice. Close and reopen Receive.</p>
+                <p className="text-xs text-neutral-500 text-center">Failed to generate invoice. Close and reopen Receive.</p>
               )}
             </div>
           )}
 
-          <div className="p-4 rounded-xl bg-neutral-900 border border-amber-500/20">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-semibold text-amber-400">Recovery Phrase</span>
-              <CopyButton text={walletData.mnemonic} />
-            </div>
-            {!walletData.recovered && (
-              <p className="text-xs text-amber-600/80 mb-2">Write this down. Never share it. It is the only way to recover your wallet.</p>
-            )}
-            <div className="grid grid-cols-4 gap-1">
-              {words.map((word, i) => (
-                <div key={i} className="px-1 py-1 rounded bg-neutral-800/60 border border-gray-700/50 text-center">
-                  <span className="text-neutral-600 mr-0.5" style={{ fontSize: '0.6rem' }}>{i + 1}.</span>
-                  <span className="text-xs text-neutral-300">{word}</span>
+          {showRecoverySeed && (
+            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-300 dark:bg-neutral-900 dark:border-neutral-700/50">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">Recovery Phrase</span>
+                <div className="flex items-center gap-2">
+                  <CopyButton text={walletData.mnemonic} />
+                  <button
+                    onClick={() => setShowRecoverySeed(false)}
+                    className="text-xs text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                  >
+                    Close
+                  </button>
                 </div>
-              ))}
+              </div>
+              {!walletData.recovered && (
+                <p className="text-xs text-neutral-500 mb-2">Write this down. Never share it. It is the only way to recover your wallet.</p>
+              )}
+              <div className="grid grid-cols-4 gap-1">
+                {words.map((word, i) => (
+                  <div key={i} className="px-1 py-1 rounded bg-white border border-neutral-200 text-center dark:bg-neutral-800/60 dark:border-gray-700/50">
+                    <span className="text-neutral-400 mr-0.5 dark:text-neutral-600" style={{ fontSize: '0.6rem' }}>{i + 1}.</span>
+                    <span className="text-xs text-neutral-700 dark:text-neutral-300">{word}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
     </div>
