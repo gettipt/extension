@@ -36,10 +36,65 @@ interface WalletData {
 
 type WalletTransfer = Record<string, unknown>;
 
+interface BrowserStorageArea {
+  get: (keys: string[], callback: (items: Record<string, unknown>) => void) => void;
+  set: (items: Record<string, string>, callback?: () => void) => void;
+}
+
 const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
 const PIN_LENGTH = 4;
+
+function getSyncStorage(): BrowserStorageArea | null {
+  const browserLike = globalThis as typeof globalThis & {
+    chrome?: {
+      storage?: {
+        sync?: BrowserStorageArea;
+      };
+    };
+  };
+
+  return browserLike.chrome?.storage?.sync ?? null;
+}
+
+async function getStoredItem(key: string): Promise<string | null> {
+  const syncStorage = getSyncStorage();
+
+  if (syncStorage) {
+    const syncValue = await new Promise<string | null>((resolve) => {
+      syncStorage.get([key], (items) => {
+        const value = items[key];
+        resolve(typeof value === 'string' ? value : null);
+      });
+    });
+
+    if (syncValue) {
+      localStorage.setItem(key, syncValue);
+      return syncValue;
+    }
+  }
+
+  const localValue = localStorage.getItem(key);
+  if (localValue && syncStorage) {
+    await new Promise<void>((resolve) => {
+      syncStorage.set({ [key]: localValue }, () => resolve());
+    });
+  }
+
+  return localValue;
+}
+
+async function setStoredItem(key: string, value: string): Promise<void> {
+  localStorage.setItem(key, value);
+
+  const syncStorage = getSyncStorage();
+  if (!syncStorage) return;
+
+  await new Promise<void>((resolve) => {
+    syncStorage.set({ [key]: value }, () => resolve());
+  });
+}
 
 function getMaxFeeSats(amountSats: number) {
   return Math.max(10, Math.ceil(amountSats * 0.01));
@@ -281,8 +336,18 @@ export default function App() {
   }, [walletData?.balanceSats]);
 
   useEffect(() => {
-    const walletData = localStorage.getItem(WALLET_KEY);
-    setAppState(walletData ? 'pin-lock' : 'idle');
+    let cancelled = false;
+
+    void (async () => {
+      const storedWallet = await getStoredItem(WALLET_KEY);
+      if (!cancelled) {
+        setAppState(storedWallet ? 'pin-lock' : 'idle');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => () => {
@@ -352,7 +417,9 @@ export default function App() {
       try {
         const balance = await wallet.getBalance();
         setWalletData((prev) => prev ? { ...prev, balanceSats: balance.balance } : prev);
-      } catch { }
+      } catch {
+        // Ignore transient polling errors and retry on the next interval.
+      }
     }, 5000);
   }, []);
 
@@ -370,7 +437,7 @@ export default function App() {
       const mnemonic: string = (result as unknown as { mnemonic?: string }).mnemonic ?? mnemonicOrSeed ?? '';
       const balance = await wallet.getBalance();
       const encrypted = await encryptText(key, mnemonic);
-      localStorage.setItem(WALLET_KEY, JSON.stringify(encrypted));
+      await setStoredItem(WALLET_KEY, JSON.stringify(encrypted));
       setWalletData({ wallet, mnemonic, balanceSats: balance.balance, recovered });
       setActivePanel(null);
       setInvoice(null);
@@ -384,7 +451,7 @@ export default function App() {
   };
 
   const afterUnlock = useCallback(async (key: CryptoKey) => {
-    const walletRaw = localStorage.getItem(WALLET_KEY);
+    const walletRaw = await getStoredItem(WALLET_KEY);
     if (!walletRaw) { setAppState('idle'); return; }
     setAppState('recovering');
     try {
@@ -417,7 +484,7 @@ export default function App() {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const key = await deriveKey(pinInput, salt);
       const verifier = await encryptText(key, SENTINEL);
-      localStorage.setItem(PIN_KEY, JSON.stringify({ salt: bufToHex(salt), verifier }));
+      await setStoredItem(PIN_KEY, JSON.stringify({ salt: bufToHex(salt), verifier }));
       setPinInput('');
       setPinConfirm('');
       setPinSetupStep('enter');
@@ -444,16 +511,20 @@ export default function App() {
     setPinLoading(true);
     setPinError(null);
     try {
-      const pinRaw = localStorage.getItem(PIN_KEY);
-      if (!pinRaw) throw new Error('No PIN stored.');
+      const pinRaw = await getStoredItem(PIN_KEY);
+      if (!pinRaw) throw new Error('PIN_NOT_FOUND');
       const { salt, verifier } = JSON.parse(pinRaw);
       const key = await deriveKey(pin, hexToBuf(salt));
       const result = await decryptText(key, verifier.iv, verifier.ct);
       if (result !== SENTINEL) throw new Error('Wrong PIN.');
       setPinInput('');
       await afterUnlock(key);
-    } catch {
-      setPinError('Incorrect PIN. Please try again.');
+    } catch (err) {
+      setPinError(
+        err instanceof Error && err.message === 'PIN_NOT_FOUND'
+          ? 'Wallet found, but PIN data has not synced yet. Please try again shortly.'
+          : 'Incorrect PIN. Please try again.',
+      );
       setPinInput('');
     } finally {
       setPinLoading(false);
@@ -473,7 +544,9 @@ export default function App() {
       try {
         const r = await walletData.wallet.createLightningInvoice({ amountSats: 0 });
         setInvoice((r as unknown as { invoice: { encodedInvoice: string } }).invoice.encodedInvoice);
-      } catch { } finally {
+      } catch {
+        // Ignore invoice creation failures here and keep the receive panel open.
+      } finally {
         setFetchingInvoice(false);
       }
     }
