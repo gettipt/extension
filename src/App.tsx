@@ -578,13 +578,6 @@ export default function App() {
   return (
     <div className="w-[324px] max-h-[600px] overflow-y-auto bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
 
-      {['creating', 'recovering', 'error'].includes(appState) && (
-        <div className="mb-5">
-          <h1 className="text-lg font-bold text-neutral-900 dark:text-white">BITCOIN BALANCE</h1>
-          <p className="text-neutral-500 text-xs">the instant payment toolkit</p>
-        </div>
-      )}
-
       {appState === 'initializing' && (
         <div className="flex flex-col items-center gap-4 py-8">
           <img src="/asterisk.png" alt="TIPT" className="w-12 h-12" />
@@ -649,11 +642,10 @@ export default function App() {
       )}
 
       {isLoading && (
-        <div className="flex justify-center py-6">
-          <div className="inline-flex items-center gap-3 px-5 py-3 rounded-xl bg-neutral-100 border border-neutral-200 dark:bg-neutral-900 dark:border-gray-800">
-            <Spinner className="w-5 h-5 text-neutral-400" />
-            <span className="text-neutral-300 text-sm">{appState === 'recovering' ? 'Recovering wallet...' : 'Creating wallet...'}</span>
-          </div>
+        <div className="flex flex-col items-center gap-4 py-8">
+          <img src="/asterisk.png" alt="TIPT" className="w-12 h-12" />
+          <Spinner className="w-6 h-6 text-neutral-400" />
+          <span className="text-neutral-400 text-sm">{appState === 'recovering' ? 'Recovering wallet...' : 'Creating wallet...'}</span>
         </div>
       )}
 
