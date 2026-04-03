@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { SparkWallet } from '@buildonspark/spark-sdk'
 import { QRCodeSVG } from 'qrcode.react'
-import { FaGear, FaXmark } from 'react-icons/fa6'
+import { FaGear, FaRightLeft } from 'react-icons/fa6'
 import {
   deriveKey, encryptText, decryptText, hexToBuf, bufToHex,
 } from './crypto'
@@ -123,24 +123,6 @@ function PinInput({
   );
 }
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  };
-  return (
-    <button
-      onClick={copy}
-      className="px-2 py-1 text-xs rounded border border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-white dark:hover:border-gray-500"
-    >
-      {copied ? 'Copied!' : 'Copy'}
-    </button>
-  );
-}
-
 export default function App() {
   const [appState, setAppState] = useState<AppState>('initializing');
   const [walletError, setWalletError] = useState<string | null>(null);
@@ -170,13 +152,26 @@ export default function App() {
   const [sendTxId, setSendTxId] = useState<string | null>(null);
   const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
-  const [showRecoverySeed, setShowRecoverySeed] = useState(false);
+  const [seedCopied, setSeedCopied] = useState(false);
+  const settingsMenuRef = useRef<HTMLDivElement>(null);
   const [invoiceCopied, setInvoiceCopied] = useState(false);
   const [balanceFlash, setBalanceFlash] = useState(false);
+  const [usdPrimary, setUsdPrimary] = useState(false);
 
   const prevBalanceRef = useRef<bigint | null>(null);
   const activePanelRef = useRef<ActivePanel>(null);
   activePanelRef.current = activePanel;
+
+  useEffect(() => {
+    if (!showSettingsMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (settingsMenuRef.current && !settingsMenuRef.current.contains(e.target as Node)) {
+        setShowSettingsMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showSettingsMenu]);
 
   useEffect(() => {
     const current = walletData?.balanceSats ?? null;
@@ -338,17 +333,6 @@ export default function App() {
     }
   };
 
-  const handleLock = () => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    setWalletData(null);
-    setPinInput('');
-    setPinError(null);
-    setActivePanel(null);
-    setShowSettingsMenu(false);
-    setShowRecoverySeed(false);
-    setAppState('pin-lock');
-  };
-
   const handleReceive = async () => {
     if (activePanel === 'receive') {
       setActivePanel(null);
@@ -445,7 +429,6 @@ export default function App() {
     }
   };
 
-  const words = walletData?.mnemonic?.split(' ') ?? [];
   const isLoading = appState === 'creating' || appState === 'recovering';
   const minSats = lnurlPayInfo ? Math.ceil(lnurlPayInfo.minSendableMsats / 1000) : 1;
   const walletMaxSendSats = walletData ? getMaxSpendableSats(Number(walletData.balanceSats)) : undefined;
@@ -460,13 +443,17 @@ export default function App() {
   const usdBalance = walletData && btcUsdRate !== null
     ? (Number(walletData.balanceSats) / 100000000) * btcUsdRate
     : null;
+  const satsDisplay = walletData ? walletData.balanceSats.toLocaleString('en-US') : '--';
+  const usdDisplay = usdBalance === null
+    ? '--'
+    : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   return (
-    <div className="w-[360px] max-h-[600px] overflow-y-auto bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="w-[360px] bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
 
       {['creating', 'recovering', 'error'].includes(appState) && (
         <div className="mb-5">
-          <h1 className="text-lg font-bold text-neutral-900 dark:text-white">TIPT</h1>
+          <h1 className="text-lg font-bold text-neutral-900 dark:text-white">BITCOIN BALANCE</h1>
           <p className="text-neutral-500 text-xs">the instant payment toolkit</p>
         </div>
       )}
@@ -619,88 +606,107 @@ export default function App() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <img src="/asterisk.png" alt="TIPT" className="w-7 h-7" />
-              <h1 className="text-lg font-bold text-neutral-900 dark:text-white">{activePanel === 'receive' ? 'RECEIVE BITCOIN' : 'TIPT'}</h1>
+              <h1 className="text-lg font-bold text-neutral-900 dark:text-neutral-200">WALLET</h1>
+              {/* <h1 className="text-lg font-bold text-neutral-900 dark:text-neutral-400">| WALLET</h1> */}
             </div>
-            <div className="relative">
-              {activePanel === 'receive' ? (
+            <div className="relative" ref={settingsMenuRef}>
+              <>
                 <button
-                  onClick={() => {
-                    setActivePanel(null);
-                    setInvoiceCopied(false);
-                  }}
-                  title="Back"
+                  onClick={() => setShowSettingsMenu((v) => !v)}
+                  title="Settings"
                   className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
                 >
-                  <FaXmark className="w-4 h-4" />
+                  <FaGear className="w-4 h-4" />
                 </button>
-              ) : (
-                <>
-                  <button
-                    onClick={() => setShowSettingsMenu((v) => !v)}
-                    title="Settings"
-                    className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
-                  >
-                    <FaGear className="w-4 h-4" />
-                  </button>
-                  {showSettingsMenu && (
-                    <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
-                      <div className="flex flex-col items-start gap-1">
-                        <button
-                          onClick={() => {
-                            setShowRecoverySeed(true);
-                            setShowSettingsMenu(false);
-                          }}
-                          className="text-xs text-neutral-700 hover:text-neutral-900 underline underline-offset-2 dark:text-neutral-300 dark:hover:text-white"
-                        >
-                          Recovery Seed
-                        </button>
-                        <button
-                          onClick={handleLock}
-                          className="text-xs text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
-                        >
-                          Lock Wallet
-                        </button>
-                      </div>
+                {showSettingsMenu && (
+                  <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
+                    <div className="flex flex-col items-start gap-1">
+                      <button
+                        onClick={() => {
+                          if (walletData) {
+                            void navigator.clipboard.writeText(walletData.mnemonic).then(() => {
+                              setSeedCopied(true);
+                              setTimeout(() => setSeedCopied(false), 2000);
+                            });
+                          }
+                          setShowSettingsMenu(false);
+                        }}
+                        className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
+                      >
+                        {seedCopied ? 'Copied!' : 'Recovery Seed'}
+                      </button>
                     </div>
-                  )}
-                </>
-              )}
+                  </div>
+                )}
+              </>
             </div>
           </div>
 
-          {activePanel !== 'receive' && (
-            <>
-              <div className="p-4 rounded-xl bg-neutral-100 dark:bg-neutral-900">
-                <p className="text-xs text-neutral-500 mb-0.5">Balance</p>
-                <div className="flex items-baseline gap-1">
-                  <span className={`text-4xl font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-600 dark:text-neutral-300'}`}>&#8383;</span>
-                  <span className={`text-4xl font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-900 dark:text-white'}`}>{walletData.balanceSats.toString()}</span>
-                </div>
-                <p className="text-xs text-neutral-600 mt-1">
-                  USD {usdBalance === null ? '--' : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                </p>
+          <>
+            <div className="p-4 rounded-xl bg-neutral-100 dark:bg-neutral-900">
+              <div>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">Balance</p>
               </div>
+              <div>
+                {usdPrimary ? (
+                  <>
+                    <p className={`mb-2 text-5xl leading-none font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-900 dark:text-neutral-200'}`}>
+                      <span className="text-neutral-500">$</span>{usdDisplay}
+                    </p>
+                    <div className="flex items-center gap-0.5">
+                      <p className="text-xs leading-none text-neutral-600 dark:text-neutral-400">
+                        &#8383;{satsDisplay}
+                      </p>
+                      <button
+                        onClick={() => setUsdPrimary((v) => !v)}
+                        title="Switch primary balance"
+                        className="p-0.5 rounded-md text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
+                      >
+                        <FaRightLeft className="w-3 h-3 rotate-90" />
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className={`mb-2 text-5xl leading-none font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-900 dark:text-neutral-200'}`}>
+                      <span className="text-neutral-500">&#8383;</span>{satsDisplay}
+                    </div>
+                    <div className="flex items-center gap-0.5">
+                      <p className="text-xs leading-none text-neutral-600 dark:text-neutral-400">
+                        ${usdDisplay} USD
+                      </p>
+                      <button
+                        onClick={() => setUsdPrimary((v) => !v)}
+                        title="Switch primary balance"
+                        className="p-0.5 rounded-md text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
+                      >
+                        <FaRightLeft className="w-3 h-3 rotate-90" />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={handleSend}
-                  className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
-                >
-                  <span className="text-md font-semibold">Send</span>
-                </button>
-                <button
-                  onClick={handleReceive}
-                  className="p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200"
-                >
-                  <span className="text-md font-semibold">Receive</span>
-                </button>
-              </div>
-            </>
-          )}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={handleSend}
+                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
+              >
+                <span className="text-md font-semibold">Send</span>
+              </button>
+              <button
+                onClick={handleReceive}
+                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
+              >
+                <span className="text-md font-semibold">Receive</span>
+              </button>
+            </div>
+          </>
 
           {activePanel === 'send' && (
             <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
-              <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Send via Lightning Address / LNURL</p>
+              {/* <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Send via Lightning Address / LNURL</p> */}
 
               {sendStep === 'input' && (
                 <div className="space-y-2">
@@ -709,7 +715,7 @@ export default function App() {
                     value={sendInput}
                     onChange={(e) => setSendInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
-                    placeholder="user@domain.com or lnurl1..."
+                    placeholder="Lightning Address (e.g. austinv@strike.me)"
                     className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
                   />
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
@@ -826,33 +832,7 @@ export default function App() {
             </div>
           )}
 
-          {showRecoverySeed && activePanel !== 'receive' && (
-            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-300 dark:bg-neutral-900 dark:border-neutral-700/50">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">Recovery Phrase</span>
-                <div className="flex items-center gap-2">
-                  <CopyButton text={walletData.mnemonic} />
-                  <button
-                    onClick={() => setShowRecoverySeed(false)}
-                    className="text-xs text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-              {!walletData.recovered && (
-                <p className="text-xs text-neutral-500 mb-2">Write this down. Never share it. It is the only way to recover your wallet.</p>
-              )}
-              <div className="grid grid-cols-4 gap-1">
-                {words.map((word, i) => (
-                  <div key={i} className="px-1 py-1 rounded bg-white border border-neutral-200 text-center dark:bg-neutral-800/60 dark:border-gray-700/50">
-                    <span className="text-neutral-400 mr-0.5 dark:text-neutral-600" style={{ fontSize: '0.6rem' }}>{i + 1}.</span>
-                    <span className="text-xs text-neutral-700 dark:text-neutral-300">{word}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+
         </div>
       )}
     </div>
