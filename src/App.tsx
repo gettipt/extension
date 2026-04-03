@@ -34,6 +34,8 @@ interface WalletData {
   recovered: boolean;
 }
 
+type WalletTransfer = Record<string, unknown>;
+
 const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
@@ -54,6 +56,88 @@ function getMaxSpendableSats(balanceSats: number) {
   }
 
   return candidate;
+}
+
+function getTransferString(transfer: WalletTransfer, keys: string[]) {
+  for (const key of keys) {
+    const value = transfer[key];
+    if (typeof value === 'string' && value.trim().length > 0) return value;
+  }
+  return null;
+}
+
+function getTransferAmountSatsLabel(transfer: WalletTransfer) {
+  const nestedAmount = (typeof transfer.totalAmount === 'object' && transfer.totalAmount !== null)
+    ? (transfer.totalAmount as { originalValue?: unknown; value?: unknown }).originalValue
+      ?? (transfer.totalAmount as { originalValue?: unknown; value?: unknown }).value
+    : undefined;
+
+  const rawAmount = transfer.totalValue
+    ?? transfer.amountSats
+    ?? transfer.amountSat
+    ?? transfer.amount
+    ?? transfer.totalAmountSats
+    ?? transfer.total_amount_sats
+    ?? transfer.value
+    ?? transfer.creditAmountSats
+    ?? transfer.debitAmountSats
+    ?? nestedAmount;
+
+  if (typeof rawAmount === 'bigint') return `\u20bf${rawAmount.toLocaleString('en-US')}`;
+  if (typeof rawAmount === 'number' && Number.isFinite(rawAmount)) return `\u20bf${Math.trunc(rawAmount).toLocaleString('en-US')}`;
+  if (typeof rawAmount === 'string' && /^-?\d+$/.test(rawAmount)) {
+    const num = Number(rawAmount);
+    return `\u20bf${num.toLocaleString('en-US')}`;
+  }
+  return '₿ --';
+}
+
+function getTransferDateLabel(transfer: WalletTransfer) {
+  const rawDate = transfer.createdTime
+    ?? transfer.createdAt
+    ?? transfer.timestamp
+    ?? transfer.created_at
+    ?? transfer.updatedAt
+    ?? transfer.updated_at;
+
+  let date: Date | null = null;
+
+  if (rawDate instanceof Date) {
+    date = rawDate;
+  } else if (typeof rawDate === 'number') {
+    const ts = rawDate < 1_000_000_000_000 ? rawDate * 1000 : rawDate;
+    date = new Date(ts);
+  } else if (typeof rawDate === 'string') {
+    if (/^\d+$/.test(rawDate)) {
+      const asNumber = Number(rawDate);
+      const ts = asNumber < 1_000_000_000_000 ? asNumber * 1000 : asNumber;
+      date = new Date(ts);
+    } else {
+      date = new Date(rawDate);
+    }
+  } else if (typeof rawDate === 'object' && rawDate !== null) {
+    const timestampLike = rawDate as { seconds?: number | string; nanos?: number };
+    if (timestampLike.seconds !== undefined) {
+      const seconds = typeof timestampLike.seconds === 'string'
+        ? Number(timestampLike.seconds)
+        : timestampLike.seconds;
+      if (Number.isFinite(seconds)) {
+        const nanos = Number.isFinite(timestampLike.nanos) ? timestampLike.nanos! : 0;
+        date = new Date((seconds * 1000) + Math.floor(nanos / 1_000_000));
+      }
+    }
+  }
+
+  if (date && !Number.isNaN(date.getTime())) {
+    return date.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+
+  return 'Time unavailable';
 }
 
 function Spinner({ className = 'w-5 h-5' }: { className?: string }) {
@@ -157,6 +241,10 @@ export default function App() {
   const [invoiceCopied, setInvoiceCopied] = useState(false);
   const [balanceFlash, setBalanceFlash] = useState(false);
   const [usdPrimary, setUsdPrimary] = useState(false);
+  const [recentTransfers, setRecentTransfers] = useState<WalletTransfer[]>([]);
+  const [loadingTransfers, setLoadingTransfers] = useState(false);
+  const [transfersError, setTransfersError] = useState<string | null>(null);
+  const [showAllTransfers, setShowAllTransfers] = useState(false);
 
   const prevBalanceRef = useRef<bigint | null>(null);
   const activePanelRef = useRef<ActivePanel>(null);
@@ -184,6 +272,9 @@ export default function App() {
       }
       setBalanceFlash(true);
       setTimeout(() => setBalanceFlash(false), 500);
+    }
+    if (walletData) {
+      void loadTransfers(walletData.wallet);
     }
     prevBalanceRef.current = current;
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -220,6 +311,41 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refreshBtcUsdRate]);
 
+  const loadTransfers = useCallback(async (wallet: SparkWallet) => {
+    setLoadingTransfers(true);
+    setTransfersError(null);
+    try {
+      const walletWithTransfers = wallet as unknown as {
+        getTransfers?: (limit?: number, offset?: number) => Promise<unknown>;
+      };
+      if (typeof walletWithTransfers.getTransfers !== 'function') {
+        setTransfersError('Transfer history is not available in this Spark SDK build.');
+        setRecentTransfers([]);
+        return;
+      }
+
+      const response = await walletWithTransfers.getTransfers(10, 0);
+      const transfersValue =
+        typeof response === 'object' && response !== null && 'transfers' in response
+          ? (response as { transfers?: unknown }).transfers
+          : [];
+
+      if (!Array.isArray(transfersValue)) {
+        setRecentTransfers([]);
+        return;
+      }
+
+      const normalized = transfersValue
+        .map((item) => (typeof item === 'object' && item !== null ? item as WalletTransfer : null))
+        .filter((item): item is WalletTransfer => item !== null);
+      setRecentTransfers(normalized);
+    } catch (err) {
+      setTransfersError(err instanceof Error ? err.message : 'Failed to load transfer history.');
+    } finally {
+      setLoadingTransfers(false);
+    }
+  }, []);
+
   const startPolling = useCallback((wallet: SparkWallet) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
@@ -250,6 +376,7 @@ export default function App() {
       setInvoice(null);
       setAppState('ready');
       startPolling(wallet);
+      void loadTransfers(wallet);
     } catch (err) {
       setWalletError(err instanceof Error ? err.message : String(err));
       setAppState('error');
@@ -602,7 +729,7 @@ export default function App() {
       )}
 
       {appState === 'ready' && walletData && (
-        <div className="space-y-3">
+        <div className="flex flex-col flex-1 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <img src="/asterisk.png" alt="TIPT" className="w-7 h-7" />
@@ -633,7 +760,7 @@ export default function App() {
                         }}
                         className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
                       >
-                        {seedCopied ? 'Copied!' : 'Recovery Seed'}
+                        {seedCopied ? 'Copied!' : 'Copy Recovery Seed'}
                       </button>
                     </div>
                   </div>
@@ -702,6 +829,49 @@ export default function App() {
                 <span className="text-md font-semibold">Receive</span>
               </button>
             </div>
+
+            {!activePanel && (
+            <div className="flex flex-col flex-1 p-3 rounded-xl bg-neutral-100 border border-neutral-200 dark:bg-neutral-900 dark:border-gray-800">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">Recent Activity</p>
+                {recentTransfers.length > 4 && (
+                  <button
+                    onClick={() => setShowAllTransfers(!showAllTransfers)}
+                    className="text-xs font-medium text-neutral-600 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200"
+                  >
+                    {showAllTransfers ? 'Show Less' : 'See All'}
+                  </button>
+                )}
+              </div>
+
+              {transfersError && (
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">{transfersError}</p>
+              )}
+
+              {!transfersError && !loadingTransfers && recentTransfers.length === 0 && (
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">No transfers yet.</p>
+              )}
+
+              {!transfersError && recentTransfers.length > 0 && (
+                <>
+                  <div className="flex-1 space-y-1 overflow-y-auto pr-1">
+                    {recentTransfers.slice(0, showAllTransfers ? undefined : 4).map((transfer, index) => {
+                      const id = getTransferString(transfer, ['id', 'transferSparkId', 'paymentId']) ?? `transfer-${index}`;
+                      const isIncoming = (transfer.transferDirection === 'INCOMING' || transfer.transferDirection === 'incoming');
+
+                      return (
+                        <div key={`${id}-${index}`} className="p-2 rounded-lg bg-white border border-neutral-200 dark:bg-neutral-800 dark:border-gray-700">
+                          <p className={`text-[11px] font-semibold ${isIncoming ? 'text-green-600 dark:text-green-400' : 'text-neutral-700 dark:text-neutral-200'}`}>{getTransferAmountSatsLabel(transfer)}</p>
+                          <p className="text-[10px] text-neutral-500 dark:text-neutral-400 mt-0.5">{getTransferDateLabel(transfer)}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+            )}
+
           </>
 
           {activePanel === 'send' && (
