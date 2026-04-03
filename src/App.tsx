@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { SparkWallet } from '@buildonspark/spark-sdk'
 import { QRCodeSVG } from 'qrcode.react'
-import { FaGear } from 'react-icons/fa6'
+import { FaGear, FaXmark } from 'react-icons/fa6'
 import {
   deriveKey, encryptText, decryptText, hexToBuf, bufToHex,
 } from './crypto'
@@ -38,6 +38,23 @@ const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
 const PIN_LENGTH = 4;
+
+function getMaxFeeSats(amountSats: number) {
+  return Math.max(10, Math.ceil(amountSats * 0.01));
+}
+
+function getMaxSpendableSats(balanceSats: number) {
+  if (balanceSats <= 10) return 0;
+
+  let candidate = Math.max(0, Math.floor((balanceSats * 100) / 101));
+  candidate = Math.min(candidate, balanceSats - 10);
+
+  while (candidate > 0 && candidate + getMaxFeeSats(candidate) > balanceSats) {
+    candidate -= 1;
+  }
+
+  return candidate;
+}
 
 function Spinner({ className = 'w-5 h-5' }: { className?: string }) {
   return (
@@ -154,6 +171,28 @@ export default function App() {
   const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const [showRecoverySeed, setShowRecoverySeed] = useState(false);
+  const [invoiceCopied, setInvoiceCopied] = useState(false);
+  const [balanceFlash, setBalanceFlash] = useState(false);
+
+  const prevBalanceRef = useRef<bigint | null>(null);
+  const activePanelRef = useRef<ActivePanel>(null);
+  activePanelRef.current = activePanel;
+
+  useEffect(() => {
+    const current = walletData?.balanceSats ?? null;
+    const prev = prevBalanceRef.current;
+    if (current !== null && prev !== null && current > prev) {
+      if (activePanelRef.current === 'receive') {
+        setActivePanel(null);
+        setInvoiceCopied(false);
+        setInvoice(null);
+      }
+      setBalanceFlash(true);
+      setTimeout(() => setBalanceFlash(false), 500);
+    }
+    prevBalanceRef.current = current;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [walletData?.balanceSats]);
 
   useEffect(() => {
     const walletData = localStorage.getItem(WALLET_KEY);
@@ -311,8 +350,13 @@ export default function App() {
   };
 
   const handleReceive = async () => {
-    if (activePanel === 'receive') { setActivePanel(null); return; }
+    if (activePanel === 'receive') {
+      setActivePanel(null);
+      setInvoiceCopied(false);
+      return;
+    }
     setActivePanel('receive');
+    setInvoiceCopied(false);
     if (!invoice && walletData) {
       setFetchingInvoice(true);
       try {
@@ -336,13 +380,23 @@ export default function App() {
   };
 
   const handleResolveLnurl = async () => {
-    if (!sendInput.trim()) return;
+    if (!sendInput.trim() || !walletData) return;
     setResolving(true);
     setSendError(null);
     try {
       const info = await resolveLnurlPayInfo(sendInput.trim());
+      const minSendableSats = Math.ceil(info.minSendableMsats / 1000);
+      const lnurlMaxSats = Math.floor(info.maxSendableMsats / 1000);
+      const maxSpendableSats = getMaxSpendableSats(Number(walletData.balanceSats));
+      const effectiveMaxSats = Math.min(lnurlMaxSats, maxSpendableSats);
+
+      if (effectiveMaxSats < minSendableSats) {
+        setSendError('Balance is too low to cover this payment plus network fees.');
+        return;
+      }
+
       setLnurlPayInfo(info);
-      setSendAmountSats(String(Math.ceil(info.minSendableMsats / 1000)));
+      setSendAmountSats(String(minSendableSats));
       setSendStep('amount');
     } catch (err) {
       setSendError(err instanceof Error ? err.message : String(err));
@@ -355,6 +409,11 @@ export default function App() {
     if (!walletData || !lnurlPayInfo) return;
     const amountSats = parseInt(sendAmountSats, 10);
     if (isNaN(amountSats) || amountSats <= 0) { setSendError('Enter a valid amount.'); return; }
+    const maxSpendableSats = getMaxSpendableSats(Number(walletData.balanceSats));
+    if (amountSats > maxSpendableSats) {
+      setSendError(`Maximum spendable amount is ${maxSpendableSats} sats after fees.`);
+      return;
+    }
     const amountMsats = amountSats * 1000;
     if (amountMsats < lnurlPayInfo.minSendableMsats) {
       setSendError(`Minimum is ${Math.ceil(lnurlPayInfo.minSendableMsats / 1000)} sats.`);
@@ -370,7 +429,7 @@ export default function App() {
       const bolt11 = await fetchInvoiceFromCallback(lnurlPayInfo.callback, amountMsats);
       const result = await walletData.wallet.payLightningInvoice({
         invoice: bolt11,
-        maxFeeSats: Math.max(10, Math.ceil(amountSats * 0.01)),
+        maxFeeSats: getMaxFeeSats(amountSats),
       });
       const txId =
         'id' in result ? (result as { id: string }).id
@@ -389,7 +448,13 @@ export default function App() {
   const words = walletData?.mnemonic?.split(' ') ?? [];
   const isLoading = appState === 'creating' || appState === 'recovering';
   const minSats = lnurlPayInfo ? Math.ceil(lnurlPayInfo.minSendableMsats / 1000) : 1;
-  const maxSats = lnurlPayInfo ? Math.floor(lnurlPayInfo.maxSendableMsats / 1000) : undefined;
+  const walletMaxSendSats = walletData ? getMaxSpendableSats(Number(walletData.balanceSats)) : undefined;
+  const lnurlMaxSats = lnurlPayInfo ? Math.floor(lnurlPayInfo.maxSendableMsats / 1000) : undefined;
+  const maxSats = lnurlMaxSats === undefined
+    ? walletMaxSendSats
+    : walletMaxSendSats === undefined
+      ? lnurlMaxSats
+      : Math.min(lnurlMaxSats, walletMaxSendSats);
   const amountNum = parseInt(sendAmountSats, 10);
   const amountValid = !isNaN(amountNum) && amountNum >= minSats && (maxSats === undefined || amountNum <= maxSats);
   const usdBalance = walletData && btcUsdRate !== null
@@ -554,65 +619,84 @@ export default function App() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <img src="/asterisk.png" alt="TIPT" className="w-7 h-7" />
-              <h1 className="text-lg font-bold text-neutral-900 dark:text-white">TIPT</h1>
+              <h1 className="text-lg font-bold text-neutral-900 dark:text-white">{activePanel === 'receive' ? 'RECEIVE BITCOIN' : 'TIPT'}</h1>
             </div>
             <div className="relative">
-              <button
-                onClick={() => setShowSettingsMenu((v) => !v)}
-                title="Settings"
-                className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
-              >
-                <FaGear className="w-4 h-4" />
-              </button>
-              {showSettingsMenu && (
-                <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
-                  <div className="flex flex-col items-start gap-1">
-                    <button
-                      onClick={() => {
-                        setShowRecoverySeed(true);
-                        setShowSettingsMenu(false);
-                      }}
-                      className="text-xs text-neutral-700 hover:text-neutral-900 underline underline-offset-2 dark:text-neutral-300 dark:hover:text-white"
-                    >
-                      Recovery Seed
-                    </button>
-                    <button
-                      onClick={handleLock}
-                      className="text-xs text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
-                    >
-                      Lock Wallet
-                    </button>
-                  </div>
-                </div>
+              {activePanel === 'receive' ? (
+                <button
+                  onClick={() => {
+                    setActivePanel(null);
+                    setInvoiceCopied(false);
+                  }}
+                  title="Back"
+                  className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
+                >
+                  <FaXmark className="w-4 h-4" />
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setShowSettingsMenu((v) => !v)}
+                    title="Settings"
+                    className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 transition-colors dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
+                  >
+                    <FaGear className="w-4 h-4" />
+                  </button>
+                  {showSettingsMenu && (
+                    <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
+                      <div className="flex flex-col items-start gap-1">
+                        <button
+                          onClick={() => {
+                            setShowRecoverySeed(true);
+                            setShowSettingsMenu(false);
+                          }}
+                          className="text-xs text-neutral-700 hover:text-neutral-900 underline underline-offset-2 dark:text-neutral-300 dark:hover:text-white"
+                        >
+                          Recovery Seed
+                        </button>
+                        <button
+                          onClick={handleLock}
+                          className="text-xs text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
+                        >
+                          Lock Wallet
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
 
-          <div className="p-4 rounded-xl bg-neutral-100 dark:bg-neutral-900">
-            <p className="text-xs text-neutral-500 mb-0.5">Balance</p>
-            <div className="flex items-baseline gap-1">
-              <span className="text-4xl text-neutral-600 font-bold dark:text-neutral-300">&#8383;</span>
-              <span className="text-4xl font-bold text-neutral-900 dark:text-white">{walletData.balanceSats.toString()}</span>
-            </div>
-            <p className="text-xs text-neutral-600 mt-1">
-              USD {usdBalance === null ? '--' : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </p>
-          </div>
+          {activePanel !== 'receive' && (
+            <>
+              <div className="p-4 rounded-xl bg-neutral-100 dark:bg-neutral-900">
+                <p className="text-xs text-neutral-500 mb-0.5">Balance</p>
+                <div className="flex items-baseline gap-1">
+                  <span className={`text-4xl font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-600 dark:text-neutral-300'}`}>&#8383;</span>
+                  <span className={`text-4xl font-bold transition-colors duration-300 ${balanceFlash ? 'text-green-500' : 'text-neutral-900 dark:text-white'}`}>{walletData.balanceSats.toString()}</span>
+                </div>
+                <p className="text-xs text-neutral-600 mt-1">
+                  USD {usdBalance === null ? '--' : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </p>
+              </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={handleSend}
-              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
-            >
-              <span className="text-md font-semibold">Send</span>
-            </button>
-            <button
-              onClick={handleReceive}
-              className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
-            >
-              <span className="text-md font-semibold">Receive</span>
-            </button>
-          </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={handleSend}
+                  className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
+                >
+                  <span className="text-md font-semibold">Send</span>
+                </button>
+                <button
+                  onClick={handleReceive}
+                  className="p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200"
+                >
+                  <span className="text-md font-semibold">Receive</span>
+                </button>
+              </div>
+            </>
+          )}
 
           {activePanel === 'send' && (
             <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
@@ -649,7 +733,7 @@ export default function App() {
                   )}
                   <div>
                     <label className="block text-xs text-neutral-400 mb-1">
-                      Amount (sats) <span className="text-neutral-600">min {minSats}{maxSats !== undefined ? ` · max ${maxSats}` : ''}</span>
+                      Amount (₿) <span className="text-neutral-600">min {minSats}{maxSats !== undefined ? ` · max ${maxSats}` : ''}</span>
                     </label>
                     <input
                       type="number"
@@ -668,7 +752,7 @@ export default function App() {
                       disabled={!amountValid}
                       className="flex-1 py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
                     >
-                      Pay {sendAmountSats} sats
+                      Pay ₿{sendAmountSats}
                     </button>
                   </div>
                 </div>
@@ -713,10 +797,6 @@ export default function App() {
 
           {activePanel === 'receive' && (
             <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Lightning Invoice</span>
-                {invoice && <CopyButton text={invoice} />}
-              </div>
               {fetchingInvoice ? (
                 <div className="flex items-center justify-center py-8 gap-2 text-neutral-500">
                   <Spinner className="w-4 h-4 text-neutral-400" />
@@ -724,15 +804,21 @@ export default function App() {
                 </div>
               ) : invoice ? (
                 <>
-                  <div className="flex justify-center">
-                    <div className="p-2.5 bg-white rounded-xl">
-                      <QRCodeSVG value={invoice} size={160} level="M" />
-                    </div>
+                  <div className="w-full">
+                    <button
+                      onClick={() => {
+                        void navigator.clipboard.writeText(invoice).then(() => {
+                          setInvoiceCopied(true);
+                          setTimeout(() => setInvoiceCopied(false), 1600);
+                        });
+                      }}
+                      title="Copy invoice"
+                      className="w-full p-3 bg-white rounded-xl block"
+                    >
+                      <QRCodeSVG value={invoice} size={256} level="M" style={{ width: '100%', height: 'auto', display: 'block' }} />
+                    </button>
                   </div>
-                  <div className="p-2.5 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-gray-700/50">
-                    <p className="text-xs font-mono text-neutral-600 break-all leading-relaxed dark:text-neutral-400">{invoice}</p>
-                  </div>
-                  <p className="text-xs text-neutral-600 text-center">Scan or share — payer chooses the amount.</p>
+                  <p className="text-xs text-neutral-600 text-center">{invoiceCopied ? 'Copied to clipboard.' : 'Tap QR to copy invoice.'}</p>
                 </>
               ) : (
                 <p className="text-xs text-neutral-500 text-center">Failed to generate invoice. Close and reopen Receive.</p>
@@ -740,7 +826,7 @@ export default function App() {
             </div>
           )}
 
-          {showRecoverySeed && (
+          {showRecoverySeed && activePanel !== 'receive' && (
             <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-300 dark:bg-neutral-900 dark:border-neutral-700/50">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-neutral-700 dark:text-neutral-300">Recovery Phrase</span>
