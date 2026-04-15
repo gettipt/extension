@@ -653,7 +653,7 @@ export default function App() {
 
       {appState === 'initializing' && (
         <div className="flex flex-col items-center gap-4 py-8">
-          <img src="/asterisk.png" alt="TIPT" className="w-12 h-12" />
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-12 h-12" />
           <Spinner className="w-6 h-6 text-neutral-400" />
         </div>
       )}
@@ -661,7 +661,7 @@ export default function App() {
       {appState === 'pin-setup' && (
         <div className="space-y-4 p-4">
           <div className="text-center">
-            <img src="/asterisk.png" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
             <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">
               {pinSetupStep === 'enter' ? 'Create a PIN' : 'Confirm your PIN'}
             </h2>
@@ -698,7 +698,7 @@ export default function App() {
       {appState === 'pin-lock' && (
         <div className="space-y-4 p-4">
           <div className="text-center">
-            <img src="/asterisk.png" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
             <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Enter your PIN</h2>
             <p className="text-xs text-neutral-500 mt-1">Your wallet is locked.</p>
           </div>
@@ -716,7 +716,7 @@ export default function App() {
 
       {isLoading && (
         <div className="flex flex-col items-center gap-4 py-8">
-          <img src="/asterisk.png" alt="TIPT" className="w-12 h-12" />
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-12 h-12" />
           <Spinner className="w-6 h-6 text-neutral-400" />
           <span className="text-neutral-400 text-sm">{appState === 'recovering' ? 'Recovering wallet...' : 'Creating wallet...'}</span>
         </div>
@@ -736,7 +736,7 @@ export default function App() {
 
       {appState === 'idle' && (
         <div className="space-y-4 py-6">
-          <img src="/asterisk.png" alt="TIPT" className="w-14 h-14 mx-auto" />
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-14 h-14 mx-auto" />
           {!showRecover ? (
             <>
               <button onClick={() => {
@@ -797,7 +797,7 @@ export default function App() {
         <div className="flex flex-col flex-1 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <img src="/asterisk.png" alt="TIPT" className="w-7 h-7" />
+              <img src="/tiptgreen.svg" alt="TIPT" className="w-7 h-7" />
               <h1 className="text-lg font-bold text-neutral-900 dark:text-neutral-200">WALLET</h1>
               {/* <h1 className="text-lg font-bold text-neutral-900 dark:text-neutral-400">| WALLET</h1> */}
             </div>
