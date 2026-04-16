@@ -45,6 +45,7 @@ const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
 const PIN_LENGTH = 4;
+const TRANSFERS_CACHE_KEY = 'spark_transfers_cache';
 
 function getSyncStorage(): BrowserStorageArea | null {
   const browserLike = globalThis as typeof globalThis & {
@@ -147,7 +148,7 @@ function getTransferAmountSatsLabel(transfer: WalletTransfer) {
   return '₿ --';
 }
 
-function getTransferDateLabel(transfer: WalletTransfer) {
+function getTransferDate(transfer: WalletTransfer): Date | null {
   const rawDate = transfer.createdTime
     ?? transfer.createdAt
     ?? transfer.timestamp
@@ -183,16 +184,33 @@ function getTransferDateLabel(transfer: WalletTransfer) {
     }
   }
 
-  if (date && !Number.isNaN(date.getTime())) {
-    return date.toLocaleString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-    });
-  }
+  return date && !Number.isNaN(date.getTime()) ? date : null;
+}
 
-  return 'Time unavailable';
+function getTransferDayLabel(transfer: WalletTransfer) {
+  const date = getTransferDate(transfer);
+  if (!date) return 'Unknown date';
+  return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+function getTransferTimeLabel(transfer: WalletTransfer) {
+  const date = getTransferDate(transfer);
+  if (!date) return '';
+  return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+
+function groupTransfersByDay(transfers: WalletTransfer[]): { day: string; transfers: WalletTransfer[] }[] {
+  const groups: { day: string; transfers: WalletTransfer[] }[] = [];
+  for (const t of transfers) {
+    const day = getTransferDayLabel(t);
+    const last = groups[groups.length - 1];
+    if (last && last.day === day) {
+      last.transfers.push(t);
+    } else {
+      groups.push({ day, transfers: [t] });
+    }
+  }
+  return groups;
 }
 
 function Spinner({ className = 'w-5 h-5' }: { className?: string }) {
@@ -255,7 +273,7 @@ function PinInput({
           onKeyDown={(e) => handleKey(i, e)}
           disabled={disabled}
           autoFocus={i === 0}
-          className="w-10 h-12 text-center text-lg font-mono rounded-lg border border-neutral-300 bg-neutral-100 text-neutral-900 focus:outline-none focus:border-neutral-500 disabled:opacity-50 caret-transparent dark:border-gray-700 dark:bg-neutral-800 dark:text-white dark:focus:border-neutral-400"
+          className="w-10 h-12 text-center text-lg font-mono rounded-lg border border-transparent bg-neutral-100 text-neutral-900 focus:outline-none focus:border-neutral-500 disabled:opacity-50 caret-transparent dark:bg-neutral-800 dark:text-white dark:focus:border-neutral-400"
         />
       ))}
     </div>
@@ -304,6 +322,7 @@ export default function App() {
   const prevBalanceRef = useRef<bigint | null>(null);
   const activePanelRef = useRef<ActivePanel>(null);
   activePanelRef.current = activePanel;
+  const cryptoKeyRef = useRef<CryptoKey | null>(null);
 
   useEffect(() => {
     if (!showSettingsMenu) return;
@@ -404,6 +423,13 @@ export default function App() {
         .map((item) => (typeof item === 'object' && item !== null ? item as WalletTransfer : null))
         .filter((item): item is WalletTransfer => item !== null);
       setRecentTransfers(normalized);
+      const key = cryptoKeyRef.current;
+      if (key) {
+        try {
+          const encrypted = await encryptText(key, JSON.stringify(normalized));
+          await setStoredItem(TRANSFERS_CACHE_KEY, JSON.stringify(encrypted));
+        } catch { /* ignore encryption/quota errors */ }
+      }
     } catch (err) {
       setTransfersError(err instanceof Error ? err.message : 'Failed to load transfer history.');
     } finally {
@@ -429,6 +455,20 @@ export default function App() {
     recovered: boolean,
   ) => {
     try {
+      cryptoKeyRef.current = key;
+      // Decrypt cached transfers in parallel with wallet init
+      const cachedTransfersPromise = (async () => {
+        try {
+          const cachedRaw = await getStoredItem(TRANSFERS_CACHE_KEY);
+          if (cachedRaw) {
+            const { iv: cIv, ct: cCt } = JSON.parse(cachedRaw);
+            const plain = await decryptText(key, cIv, cCt);
+            const parsed = JSON.parse(plain) as WalletTransfer[];
+            if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+          }
+        } catch { /* ignore cache decryption errors */ }
+        return null;
+      })();
       const result = await SparkWallet.initialize({
         ...(mnemonicOrSeed ? { mnemonicOrSeed } : {}),
         options: { network: 'MAINNET' },
@@ -438,6 +478,8 @@ export default function App() {
       const balance = await wallet.getBalance();
       const encrypted = await encryptText(key, mnemonic);
       await setStoredItem(WALLET_KEY, JSON.stringify(encrypted));
+      const cachedTransfers = await cachedTransfersPromise;
+      if (cachedTransfers) setRecentTransfers(cachedTransfers);
       setWalletData({ wallet, mnemonic, balanceSats: balance.balance, recovered });
       setActivePanel(null);
       setInvoice(null);
@@ -749,7 +791,7 @@ export default function App() {
               }} className="w-full py-3 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 active:bg-neutral-950 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 dark:active:bg-neutral-300">
                 Create Wallet
               </button>
-              <button onClick={() => setShowRecover(true)} className="w-full py-2.5 text-sm font-semibold rounded-xl border border-neutral-300 text-neutral-700 hover:border-neutral-400 hover:bg-neutral-100 transition-colors dark:border-gray-700 dark:text-neutral-200 dark:hover:border-gray-500 dark:hover:bg-neutral-800">
+              <button onClick={() => setShowRecover(true)} className="w-full py-2.5 text-sm font-semibold rounded-xl border border-neutral-300 text-neutral-700 hover:border-neutral-400 hover:bg-neutral-100 transition-colors dark:border-neutral-700 dark:text-neutral-200 dark:hover:border-neutral-500 dark:hover:bg-neutral-800">
                 Recover Wallet
               </button>
               <a href="#" onClick={(e) => e.preventDefault()} className="block w-full text-center text-xs text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
@@ -763,10 +805,10 @@ export default function App() {
                 onChange={(e) => setRecoverInput(e.target.value)}
                 placeholder="Enter your 12 or 24 word recovery phrase..."
                 rows={3}
-                className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+                className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
               />
               <div className="flex gap-2">
-                <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:border-gray-600 dark:hover:text-neutral-200">
+                <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
                   Cancel
                 </button>
                 <button
@@ -811,7 +853,7 @@ export default function App() {
                   <FaGear className="w-4 h-4" />
                 </button>
                 {showSettingsMenu && (
-                  <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-gray-800">
+                  <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
                     <div className="flex flex-col items-start gap-1">
                       <button
                         onClick={() => {
@@ -837,7 +879,7 @@ export default function App() {
           <>
             <div className="px-4 py-3 rounded-xl bg-neutral-100 dark:bg-neutral-900">
               <div>
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">Balance</p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">BALANCE</p>
               </div>
               <div>
                 {usdPrimary ? (
@@ -883,22 +925,22 @@ export default function App() {
             <div className="grid grid-cols-2 gap-2">
               <button
                 onClick={handleSend}
-                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
+                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'send' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-transparent text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:text-neutral-400 dark:hover:border-neutral-700 dark:hover:text-neutral-200'}`}
               >
                 <span className="text-md font-semibold">Send</span>
               </button>
               <button
                 onClick={handleReceive}
-                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-neutral-200 text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:border-gray-800 dark:text-neutral-400 dark:hover:border-gray-700 dark:hover:text-neutral-200'}`}
+                className={`p-3 rounded-xl border flex flex-col items-center gap-2 transition-colors ${activePanel === 'receive' ? 'bg-neutral-200 border-neutral-400 text-neutral-900 dark:bg-neutral-700 dark:border-neutral-500 dark:text-neutral-100' : 'bg-neutral-100 border-transparent text-neutral-500 hover:border-neutral-300 hover:text-neutral-800 dark:bg-neutral-900 dark:text-neutral-400 dark:hover:border-neutral-700 dark:hover:text-neutral-200'}`}
               >
                 <span className="text-md font-semibold">Receive</span>
               </button>
             </div>
 
             {!activePanel && (
-            <div className="flex flex-col flex-1 p-3 rounded-xl bg-neutral-100 border border-neutral-200 dark:bg-neutral-900 dark:border-gray-800">
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">Recent Activity</p>
+            <div className="flex flex-col flex-1 rounded-xl bg-neutral-100 border border-neutral-200 dark:bg-neutral-900 dark:border-neutral-800 overflow-hidden">
+              <div className="flex items-center justify-between px-3 pt-3 mb-2">
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">RECENT ACTIVITY</p>
                 {recentTransfers.length > 4 && (
                   <button
                     onClick={() => setShowAllTransfers(!showAllTransfers)}
@@ -910,29 +952,37 @@ export default function App() {
               </div>
 
               {transfersError && (
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">{transfersError}</p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400 px-3 pb-3">{transfersError}</p>
               )}
 
               {!transfersError && !loadingTransfers && recentTransfers.length === 0 && (
-                <p className="text-xs text-neutral-500 dark:text-neutral-400">No transfers yet.</p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400 px-3 pb-3">No transfers yet.</p>
               )}
 
               {!transfersError && recentTransfers.length > 0 && (
-                <>
-                  <div className="flex-1 space-y-1 overflow-y-auto pr-1">
-                    {recentTransfers.slice(0, showAllTransfers ? undefined : 4).map((transfer, index) => {
-                      const id = getTransferString(transfer, ['id', 'transferSparkId', 'paymentId']) ?? `transfer-${index}`;
-                      const isIncoming = (transfer.transferDirection === 'INCOMING' || transfer.transferDirection === 'incoming');
+                <div className="flex-1 overflow-y-auto space-y-2 pb-3">
+                  {groupTransfersByDay(recentTransfers.slice(0, showAllTransfers ? undefined : 4)).map((group) => (
+                    <div key={group.day}>
+                      <p className="text-xs font-semibold text-neutral-700 dark:text-neutral-300 px-3 py-1 bg-neutral-200/60 dark:bg-neutral-800">{group.day}</p>
+                      <div className="divide-y divide-neutral-200 dark:divide-neutral-800 px-3">
+                        {group.transfers.map((transfer, index) => {
+                          const id = getTransferString(transfer, ['id', 'transferSparkId', 'paymentId']) ?? `transfer-${index}`;
+                          const isIncoming = (transfer.transferDirection === 'INCOMING' || transfer.transferDirection === 'incoming');
 
-                      return (
-                        <div key={`${id}-${index}`} className="p-2 rounded-lg bg-white border border-neutral-200 dark:bg-neutral-800 dark:border-gray-700">
-                          <p className={`text-[11px] font-semibold ${isIncoming ? 'text-green-600 dark:text-green-400' : 'text-neutral-700 dark:text-neutral-200'}`}>{getTransferAmountSatsLabel(transfer)}</p>
-                          <p className="text-[10px] text-neutral-500 dark:text-neutral-400 mt-0.5">{getTransferDateLabel(transfer)}</p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </>
+                          return (
+                            <div key={`${id}-${index}`} className="py-2 flex items-center justify-between">
+                              <div>
+                                <p className={`text-xs font-medium ${isIncoming ? 'text-green-600 dark:text-green-400' : 'text-neutral-600 dark:text-neutral-400'}`}>{isIncoming ? 'Received' : 'Sent'}</p>
+                                <p className="text-[10px] text-neutral-400 dark:text-neutral-500 mt-0.5">{getTransferTimeLabel(transfer)}</p>
+                              </div>
+                              <p className={`text-sm font-semibold ${isIncoming ? 'text-green-600 dark:text-green-400' : 'text-neutral-700 dark:text-neutral-200'}`}><span className="text-neutral-500">&#8383;</span>{getTransferAmountSatsLabel(transfer).replace(/^₿/, '')}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
             )}
@@ -940,7 +990,7 @@ export default function App() {
           </>
 
           {activePanel === 'send' && (
-            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
+            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-neutral-800">
               {/* <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Send via Lightning Address / LNURL</p> */}
 
               {sendStep === 'input' && (
@@ -951,7 +1001,7 @@ export default function App() {
                     onChange={(e) => setSendInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
                     placeholder="Lightning Address (e.g. austinv@strike.me)"
-                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
                   />
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
                   <button
@@ -967,7 +1017,7 @@ export default function App() {
               {sendStep === 'amount' && lnurlPayInfo && (
                 <div className="space-y-2">
                   {lnurlPayInfo.description && (
-                    <div className="px-3 py-2 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-gray-700/50">
+                    <div className="px-3 py-2 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-neutral-700/50">
                       <p className="text-xs text-neutral-500 mb-0.5">Paying to</p>
                       <p className="text-xs text-neutral-700 dark:text-neutral-200">{lnurlPayInfo.description}</p>
                     </div>
@@ -980,12 +1030,12 @@ export default function App() {
                       type="number"
                       value={sendAmountSats}
                       onChange={(e) => setSendAmountSats(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-gray-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
+                      className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
                     />
                   </div>
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
                   <div className="flex gap-2">
-                    <button onClick={() => { setSendStep('input'); setLnurlPayInfo(null); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:border-gray-600 dark:hover:text-neutral-200">
+                    <button onClick={() => { setSendStep('input'); setLnurlPayInfo(null); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
                       Back
                     </button>
                     <button
@@ -1019,7 +1069,7 @@ export default function App() {
                       {sendTxId && <p className="text-xs text-neutral-500 font-mono break-all mt-0.5">{sendTxId}</p>}
                     </div>
                   </div>
-                  <button onClick={handleSend} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-gray-600">
+                  <button onClick={handleSend} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600">
                     Send another
                   </button>
                 </div>
@@ -1028,7 +1078,7 @@ export default function App() {
               {sendStep === 'error' && (
                 <div className="space-y-2">
                   <div className="p-3 rounded-lg bg-neutral-100 border border-neutral-300 text-neutral-600 text-xs dark:bg-neutral-800/50 dark:border-neutral-600/30 dark:text-neutral-400">{sendError}</div>
-                  <button onClick={() => { setSendStep('amount'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-gray-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-gray-600">
+                  <button onClick={() => { setSendStep('amount'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600">
                     Try Again
                   </button>
                 </div>
@@ -1037,7 +1087,7 @@ export default function App() {
           )}
 
           {activePanel === 'receive' && (
-            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-gray-800">
+            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-neutral-800">
               {fetchingInvoice ? (
                 <div className="flex items-center justify-center py-8 gap-2 text-neutral-500">
                   <Spinner className="w-4 h-4 text-neutral-400" />
