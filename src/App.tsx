@@ -298,10 +298,11 @@ export default function App() {
   const [activePanel, setActivePanel] = useState<ActivePanel>(null);
   const [invoice, setInvoice] = useState<string | null>(null);
   const [fetchingInvoice, setFetchingInvoice] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const walletRef = useRef<SparkWallet | null>(null);
 
   const [sendStep, setSendStep] = useState<SendStep>('input');
   const [sendInput, setSendInput] = useState('');
+  const [resolvedInput, setResolvedInput] = useState('');
   const [sendAmountSats, setSendAmountSats] = useState('');
   const [lnurlPayInfo, setLnurlPayInfo] = useState<LnurlPayInfo | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -309,7 +310,6 @@ export default function App() {
   const [sendTxId, setSendTxId] = useState<string | null>(null);
   const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
-  const [seedCopied, setSeedCopied] = useState(false);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
   const [invoiceCopied, setInvoiceCopied] = useState(false);
   const [balanceFlash, setBalanceFlash] = useState(false);
@@ -370,7 +370,7 @@ export default function App() {
   }, []);
 
   useEffect(() => () => {
-    if (pollRef.current) clearInterval(pollRef.current);
+    if (walletRef.current) walletRef.current.removeAllListeners();
   }, []);
 
   const refreshBtcUsdRate = useCallback(async () => {
@@ -437,16 +437,23 @@ export default function App() {
     }
   }, []);
 
-  const startPolling = useCallback((wallet: SparkWallet) => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
-      try {
-        const balance = await wallet.getBalance();
-        setWalletData((prev) => prev ? { ...prev, balanceSats: balance.balance } : prev);
-      } catch {
-        // Ignore transient polling errors and retry on the next interval.
-      }
-    }, 5000);
+  const subscribeToWalletEvents = useCallback((wallet: SparkWallet) => {
+    // Clean up previous listeners if any
+    if (walletRef.current) {
+      walletRef.current.removeAllListeners();
+    }
+    walletRef.current = wallet;
+
+    // Use only the definitive events that fire once with the final settled balance.
+    // Avoid 'balance:update' — it fires multiple times as individual leaves are
+    // claimed, causing the displayed balance to tick up in chunks.
+    wallet.on('transfer:claimed', (_transferId: string, updatedBalance: bigint) => {
+      setWalletData((prev) => prev ? { ...prev, balanceSats: updatedBalance } : prev);
+    });
+
+    wallet.on('deposit:confirmed', (_depositId: string, updatedBalance: bigint) => {
+      setWalletData((prev) => prev ? { ...prev, balanceSats: updatedBalance } : prev);
+    });
   }, []);
 
   const doInitWallet = async (
@@ -484,7 +491,7 @@ export default function App() {
       setActivePanel(null);
       setInvoice(null);
       setAppState('ready');
-      startPolling(wallet);
+      subscribeToWalletEvents(wallet);
       void loadTransfers(wallet);
     } catch (err) {
       setWalletError(err instanceof Error ? err.message : String(err));
@@ -622,7 +629,8 @@ export default function App() {
       }
 
       setLnurlPayInfo(info);
-      setSendAmountSats(String(minSendableSats));
+      setResolvedInput(sendInput.trim());
+      setSendAmountSats('');
       setSendStep('amount');
     } catch (err) {
       setSendError(err instanceof Error ? err.message : String(err));
@@ -858,16 +866,19 @@ export default function App() {
                       <button
                         onClick={() => {
                           if (walletData) {
-                            void navigator.clipboard.writeText(walletData.mnemonic).then(() => {
-                              setSeedCopied(true);
-                              setTimeout(() => setSeedCopied(false), 2000);
-                            });
+                            const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = 'tipt-recovery-seed.txt';
+                            a.click();
+                            URL.revokeObjectURL(url);
                           }
                           setShowSettingsMenu(false);
                         }}
                         className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
                       >
-                        {seedCopied ? 'Copied!' : 'Copy Recovery Seed'}
+                        Download Recovery Seed
                       </button>
                     </div>
                   </div>
@@ -960,7 +971,7 @@ export default function App() {
               )}
 
               {!transfersError && recentTransfers.length > 0 && (
-                <div className="flex-1 overflow-y-auto space-y-2 pb-3">
+                <div className="flex-1 overflow-y-auto pb-3">
                   {groupTransfersByDay(recentTransfers.slice(0, showAllTransfers ? undefined : 4)).map((group) => (
                     <div key={group.day}>
                       <p className="text-xs font-semibold text-neutral-700 dark:text-neutral-300 px-3 py-1 bg-neutral-200/60 dark:bg-neutral-800">{group.day}</p>
@@ -1000,7 +1011,7 @@ export default function App() {
                     value={sendInput}
                     onChange={(e) => setSendInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
-                    placeholder="Lightning Address (e.g. austinv@strike.me)"
+                    placeholder="e.g. austinvach@cash.app"
                     className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
                   />
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
@@ -1016,36 +1027,50 @@ export default function App() {
 
               {sendStep === 'amount' && lnurlPayInfo && (
                 <div className="space-y-2">
-                  {lnurlPayInfo.description && (
-                    <div className="px-3 py-2 rounded-lg bg-neutral-100 border border-neutral-200 dark:bg-neutral-800/60 dark:border-neutral-700/50">
-                      <p className="text-xs text-neutral-500 mb-0.5">Paying to</p>
-                      <p className="text-xs text-neutral-700 dark:text-neutral-200">{lnurlPayInfo.description}</p>
-                    </div>
-                  )}
+                  <input
+                    type="text"
+                    value={sendInput}
+                    onChange={(e) => {
+                      setSendInput(e.target.value);
+                      if (e.target.value.trim() !== resolvedInput) {
+                        setLnurlPayInfo(null);
+                        setSendAmountSats('');
+                        setSendError(null);
+                        setSendStep('input');
+                      }
+                    }}
+                    onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
+                    placeholder="austinvach@cash.app"
+                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+                  />
                   <div>
                     <label className="block text-xs text-neutral-400 mb-1">
-                      Amount (₿) <span className="text-neutral-600">min {minSats}{maxSats !== undefined ? ` · max ${maxSats}` : ''}</span>
+                      Amount (₿){maxSats !== undefined ? <span className="text-neutral-600"> max {maxSats}</span> : ''}
                     </label>
                     <input
                       type="number"
+                      min="1"
                       value={sendAmountSats}
                       onChange={(e) => setSendAmountSats(e.target.value)}
                       className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
                     />
                   </div>
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
-                  <div className="flex gap-2">
-                    <button onClick={() => { setSendStep('input'); setLnurlPayInfo(null); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
-                      Back
-                    </button>
+                  {maxSats !== undefined && maxSats > 0 && (
                     <button
-                      onClick={handleSendPayment}
-                      disabled={!amountValid}
-                      className="flex-1 py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+                      onClick={() => setSendAmountSats(String(maxSats))}
+                      className="w-full py-2 text-xs font-semibold rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200"
                     >
-                      Pay ₿{sendAmountSats}
+                      Send Max
                     </button>
-                  </div>
+                  )}
+                  <button
+                    onClick={handleSendPayment}
+                    disabled={!amountValid}
+                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+                  >
+                    Pay
+                  </button>
                 </div>
               )}
 
