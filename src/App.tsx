@@ -877,7 +877,7 @@ export default function App() {
               </button>
               <label className="flex items-center justify-center gap-1.5 w-full py-2.5 text-sm font-medium rounded-xl border border-dashed border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 cursor-pointer transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
                 <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5-5m0 0l5 5m-5-5v12" /></svg>
-                Upload Recovery File
+                Upload Backup File
                 <input
                   type="file"
                   accept=".txt,.text,text/plain"
@@ -917,7 +917,7 @@ export default function App() {
             <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
             <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Back Up Your Wallet</h2>
             <p className="text-xs text-neutral-500 mt-1">
-              Download your backup file and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
+              Download your backup file and store it somewhere safe. It will help you recover your wallet if you lose access.
             </p>
           </div>
           <button
