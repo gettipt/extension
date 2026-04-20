@@ -723,7 +723,7 @@ export default function App() {
               {pinSetupStep === 'enter' ? 'Create a PIN' : 'Confirm your PIN'}
             </h2>
             <p className="text-xs text-neutral-500 mt-1">
-              {pinSetupStep === 'enter' ? `Choose a ${PIN_LENGTH}-digit PIN for your new wallet.` : 'Re-enter your PIN to confirm.'}
+              {pinSetupStep === 'enter' ? `Choose a ${PIN_LENGTH}-digit PIN for your wallet.` : 'Re-enter your PIN to confirm.'}
             </p>
           </div>
           <PinInput
@@ -799,8 +799,8 @@ export default function App() {
         <div className="space-y-4 p-4">
           <div className="text-center">
             <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
-            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Get Started</h2>
-            <p className="text-xs text-neutral-500 mt-1">Create a new wallet or recover an existing one.</p>
+            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">{showRecover ? 'Recover Wallet' : 'Get Started'}</h2>
+            <p className="text-xs text-neutral-500 mt-1">{showRecover ? 'Enter your seed phrase or upload your recovery file to restore your wallet.' : 'Create a new wallet or recover an existing one.'}</p>
           </div>
           {!showRecover ? (
             <>
@@ -842,7 +842,7 @@ export default function App() {
                     setAppState('pin-setup');
                   }
                 }}
-                placeholder="Enter your 12 or 24 word recovery phrase..."
+                placeholder="Enter your seed phrase..."
                 rows={3}
                 className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
               />
