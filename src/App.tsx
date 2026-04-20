@@ -16,6 +16,7 @@ type AppState =
   | 'idle'
   | 'creating'
   | 'recovering'
+  | 'backup-prompt'
   | 'ready'
   | 'error';
 
@@ -24,7 +25,7 @@ type ActivePanel = 'send' | 'receive' | null;
 type SendStep = 'input' | 'amount' | 'sending' | 'success' | 'error';
 type PendingWalletAction =
   | { type: 'create' }
-  | { type: 'recover'; mnemonic: string }
+  | { type: 'recover'; mnemonic: string; fromFile?: boolean }
   | null;
 
 interface WalletData {
@@ -44,7 +45,7 @@ interface BrowserStorageArea {
 const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
-const PIN_LENGTH = 4;
+const PIN_LENGTH = 5;
 const TRANSFERS_CACHE_KEY = 'spark_transfers_cache';
 
 function getSyncStorage(): BrowserStorageArea | null {
@@ -230,11 +231,7 @@ function PinInput({
   onSubmit?: (v: string) => void;
   disabled?: boolean;
 }) {
-  const r0 = useRef<HTMLInputElement>(null);
-  const r1 = useRef<HTMLInputElement>(null);
-  const r2 = useRef<HTMLInputElement>(null);
-  const r3 = useRef<HTMLInputElement>(null);
-  const refs = [r0, r1, r2, r3];
+  const refs = Array.from({ length: PIN_LENGTH }, () => useRef<HTMLInputElement>(null));
   const digits = value.split('').concat(Array(PIN_LENGTH).fill('')).slice(0, PIN_LENGTH);
 
   const handleKey = (i: number, e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -294,6 +291,8 @@ export default function App() {
   const [btcUsdRate, setBtcUsdRate] = useState<number | null>(null);
   const [recoverInput, setRecoverInput] = useState('');
   const [showRecover, setShowRecover] = useState(false);
+  const [backupDownloaded, setBackupDownloaded] = useState(false);
+  const skipBackupRef = useRef(false);
 
   const [activePanel, setActivePanel] = useState<ActivePanel>(null);
   const [invoice, setInvoice] = useState<string | null>(null);
@@ -490,7 +489,12 @@ export default function App() {
       setWalletData({ wallet, mnemonic, balanceSats: balance.balance, recovered });
       setActivePanel(null);
       setInvoice(null);
-      setAppState('ready');
+      if (!skipBackupRef.current) {
+        setBackupDownloaded(false);
+        setAppState('backup-prompt');
+      } else {
+        setAppState('ready');
+      }
       subscribeToWalletEvents(wallet);
       void loadTransfers(wallet);
     } catch (err) {
@@ -502,6 +506,7 @@ export default function App() {
   const afterUnlock = useCallback(async (key: CryptoKey) => {
     const walletRaw = await getStoredItem(WALLET_KEY);
     if (!walletRaw) { setAppState('idle'); return; }
+    skipBackupRef.current = true;
     setAppState('recovering');
     try {
       const { iv, ct } = JSON.parse(walletRaw);
@@ -538,10 +543,12 @@ export default function App() {
       setPinConfirm('');
       setPinSetupStep('enter');
       if (pendingWalletAction?.type === 'create') {
+        skipBackupRef.current = false;
         setPendingWalletAction(null);
         setAppState('creating');
         await doInitWallet(undefined, key, false);
       } else if (pendingWalletAction?.type === 'recover') {
+        skipBackupRef.current = !!pendingWalletAction.fromFile;
         setPendingWalletAction(null);
         setAppState('recovering');
         await doInitWallet(pendingWalletAction.mnemonic, key, true);
@@ -737,9 +744,13 @@ export default function App() {
           >
             {pinLoading ? (<><Spinner className="w-4 h-4" /> Setting up...</>) : pinSetupStep === 'enter' ? 'Next' : 'Confirm PIN'}
           </button>
-          {pinSetupStep === 'confirm' && (
-            <button onClick={() => { setPinSetupStep('enter'); setPinConfirm(''); setPinError(null); }} className="w-full text-center text-xs text-neutral-600 hover:text-neutral-400 transition-colors">
+          {pinSetupStep === 'confirm' ? (
+            <button onClick={() => { setPinSetupStep('enter'); setPinConfirm(''); setPinError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
               Back
+            </button>
+          ) : (
+            <button onClick={() => { setPendingWalletAction(null); setPinInput(''); setPinError(null); setAppState('idle'); }} className="block w-full text-center text-sm text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
+              Cancel
             </button>
           )}
         </div>
@@ -802,25 +813,19 @@ export default function App() {
               <button onClick={() => setShowRecover(true)} className="w-full py-2.5 text-sm font-semibold rounded-xl border border-neutral-300 text-neutral-700 hover:border-neutral-400 hover:bg-neutral-100 transition-colors dark:border-neutral-700 dark:text-neutral-200 dark:hover:border-neutral-500 dark:hover:bg-neutral-800">
                 Recover Wallet
               </button>
-              <a href="#" onClick={(e) => e.preventDefault()} className="block w-full text-center text-xs text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
+              <a href="#" onClick={(e) => e.preventDefault()} className="block w-full text-center text-sm text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
                 Setup Instructions
               </a>
             </>
           ) : (
             <div className="space-y-3">
               <textarea
+                autoFocus
                 value={recoverInput}
                 onChange={(e) => setRecoverInput(e.target.value)}
-                placeholder="Enter your 12 or 24 word recovery phrase..."
-                rows={3}
-                className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
-              />
-              <div className="flex gap-2">
-                <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="flex-1 py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
-                  Cancel
-                </button>
-                <button
-                  onClick={() => {
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
                     const t = recoverInput.trim();
                     if (!t) return;
                     setPendingWalletAction({ type: 'recover', mnemonic: t });
@@ -831,15 +836,95 @@ export default function App() {
                     setPinError(null);
                     setPinSetupStep('enter');
                     setAppState('pin-setup');
+                  }
+                }}
+                placeholder="Enter your 12 or 24 word recovery phrase..."
+                rows={3}
+                className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 font-mono resize-none focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-400 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+              />
+              <button
+                onClick={() => {
+                  const t = recoverInput.trim();
+                  if (!t) return;
+                  setPendingWalletAction({ type: 'recover', mnemonic: t });
+                  setShowRecover(false);
+                  setRecoverInput('');
+                  setPinInput('');
+                  setPinConfirm('');
+                  setPinError(null);
+                  setPinSetupStep('enter');
+                  setAppState('pin-setup');
+                }}
+                disabled={!recoverInput.trim()}
+                className="w-full py-2.5 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+              >
+                Recover
+              </button>
+              <label className="flex items-center justify-center gap-1.5 w-full py-2.5 text-sm font-medium rounded-xl border border-dashed border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 cursor-pointer transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200">
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5-5m0 0l5 5m-5-5v12" /></svg>
+                Upload Recovery File
+                <input
+                  type="file"
+                  accept=".txt,.text,text/plain"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      const text = (reader.result as string).trim();
+                      if (!text) return;
+                      setPendingWalletAction({ type: 'recover', mnemonic: text, fromFile: true });
+                      setShowRecover(false);
+                      setRecoverInput('');
+                      setPinInput('');
+                      setPinConfirm('');
+                      setPinError(null);
+                      setPinSetupStep('enter');
+                      setAppState('pin-setup');
+                    };
+                    reader.readAsText(file);
+                    e.target.value = '';
                   }}
-                  disabled={!recoverInput.trim()}
-                  className="flex-1 py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
-                >
-                  Recover
-                </button>
-              </div>
+                />
+              </label>
+              <button onClick={() => { setShowRecover(false); setRecoverInput(''); }} className="block w-full text-center text-sm text-neutral-500 hover:text-neutral-900 underline underline-offset-2 transition-colors dark:text-neutral-600 dark:hover:text-neutral-100">
+                Cancel
+              </button>
             </div>
           )}
+        </div>
+      )}
+
+      {appState === 'backup-prompt' && walletData && (
+        <div className="space-y-4 py-6 text-center">
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-14 h-14 mx-auto" />
+          <h2 className="text-base font-bold text-neutral-900 dark:text-neutral-100">Back Up Your Wallet</h2>
+          <p className="text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed px-2">
+            Download your recovery phrase and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
+          </p>
+          <button
+            onClick={() => {
+              const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = 'TIPT-Wallet-Recovery-Seed.txt';
+              a.click();
+              URL.revokeObjectURL(url);
+              setBackupDownloaded(true);
+            }}
+            className="w-full py-3 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 active:bg-neutral-950 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 dark:active:bg-neutral-300"
+          >
+            Download Recovery Phrase
+          </button>
+          <button
+            onClick={() => setAppState('ready')}
+            disabled={!backupDownloaded}
+            className="w-full py-2.5 text-sm font-semibold rounded-xl border border-neutral-300 text-neutral-700 hover:border-neutral-400 hover:bg-neutral-100 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:border-neutral-700 dark:text-neutral-200 dark:hover:border-neutral-500 dark:hover:bg-neutral-800"
+          >
+            Continue to Wallet
+          </button>
         </div>
       )}
 
@@ -870,7 +955,7 @@ export default function App() {
                             const url = URL.createObjectURL(blob);
                             const a = document.createElement('a');
                             a.href = url;
-                            a.download = 'tipt-recovery-seed.txt';
+                            a.download = 'TIPT-Wallet-Recovery.txt';
                             a.click();
                             URL.revokeObjectURL(url);
                           }
