@@ -710,7 +710,7 @@ export default function App() {
 
       {appState === 'initializing' && (
         <div className="flex flex-col items-center gap-4 py-8">
-          <img src="/tiptgreen.svg" alt="TIPT" className="w-12 h-12" />
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10" />
           <Spinner className="w-6 h-6 text-neutral-400" />
         </div>
       )}
@@ -777,7 +777,7 @@ export default function App() {
 
       {isLoading && (
         <div className="flex flex-col items-center gap-4 py-8">
-          <img src="/tiptgreen.svg" alt="TIPT" className="w-12 h-12" />
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10" />
           <Spinner className="w-6 h-6 text-neutral-400" />
           <span className="text-neutral-400 text-sm">{appState === 'recovering' ? 'Recovering wallet...' : 'Creating wallet...'}</span>
         </div>
@@ -796,8 +796,12 @@ export default function App() {
       )}
 
       {appState === 'idle' && (
-        <div className="space-y-4 py-6">
-          <img src="/tiptgreen.svg" alt="TIPT" className="w-14 h-14 mx-auto" />
+        <div className="space-y-4 p-4">
+          <div className="text-center">
+            <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Get Started</h2>
+            <p className="text-xs text-neutral-500 mt-1">Create a new wallet or recover an existing one.</p>
+          </div>
           {!showRecover ? (
             <>
               <button onClick={() => {
@@ -897,12 +901,14 @@ export default function App() {
       )}
 
       {appState === 'backup-prompt' && walletData && (
-        <div className="space-y-4 py-6 text-center">
-          <img src="/tiptgreen.svg" alt="TIPT" className="w-14 h-14 mx-auto" />
-          <h2 className="text-base font-bold text-neutral-900 dark:text-neutral-100">Back Up Your Wallet</h2>
-          <p className="text-xs text-neutral-500 dark:text-neutral-400 leading-relaxed px-2">
-            Download your recovery phrase and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
-          </p>
+        <div className="space-y-4 p-4">
+          <div className="text-center">
+            <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
+            <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Back Up Your Wallet</h2>
+            <p className="text-xs text-neutral-500 mt-1">
+              Download your recovery phrase and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
+            </p>
+          </div>
           <button
             onClick={() => {
               const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
