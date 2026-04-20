@@ -323,6 +323,17 @@ export default function App() {
   activePanelRef.current = activePanel;
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
 
+  const downloadBackupFile = useCallback(() => {
+    if (!walletData) return;
+    const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'TIPT-Wallet-Backup.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [walletData]);
+
   useEffect(() => {
     if (!showSettingsMenu) return;
     const handler = (e: MouseEvent) => {
@@ -800,7 +811,7 @@ export default function App() {
           <div className="text-center">
             <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
             <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">{showRecover ? 'Recover Wallet' : 'Get Started'}</h2>
-            <p className="text-xs text-neutral-500 mt-1">{showRecover ? 'Enter your seed phrase or upload your recovery file to restore your wallet.' : 'Create a new wallet or recover an existing one.'}</p>
+            <p className="text-xs text-neutral-500 mt-1">{showRecover ? 'Enter your seed phrase or upload your backup file to restore your wallet.' : 'Create a new wallet or recover an existing one.'}</p>
           </div>
           {!showRecover ? (
             <>
@@ -906,23 +917,17 @@ export default function App() {
             <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
             <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Back Up Your Wallet</h2>
             <p className="text-xs text-neutral-500 mt-1">
-              Download your recovery phrase and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
+              Download your backup file and store it somewhere safe. Without it, you cannot recover your wallet if you lose access.
             </p>
           </div>
           <button
             onClick={() => {
-              const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = 'TIPT-Wallet-Recovery-Seed.txt';
-              a.click();
-              URL.revokeObjectURL(url);
+              downloadBackupFile();
               setBackupDownloaded(true);
             }}
             className="w-full py-3 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 active:bg-neutral-950 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 dark:active:bg-neutral-300"
           >
-            Download Recovery Phrase
+            Download Backup File
           </button>
           <button
             onClick={() => setAppState('ready')}
@@ -956,20 +961,12 @@ export default function App() {
                     <div className="flex flex-col items-start gap-1">
                       <button
                         onClick={() => {
-                          if (walletData) {
-                            const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
-                            const url = URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = 'TIPT-Wallet-Recovery.txt';
-                            a.click();
-                            URL.revokeObjectURL(url);
-                          }
+                          downloadBackupFile();
                           setShowSettingsMenu(false);
                         }}
                         className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
                       >
-                        Download Recovery Seed
+                        Download Backup File
                       </button>
                     </div>
                   </div>
