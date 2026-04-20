@@ -519,7 +519,7 @@ export default function App() {
   }, []);
 
   const handlePinSetupNext = (pin = pinInput) => {
-    if (pin.length < PIN_LENGTH) { setPinError('PIN must be exactly 4 digits.'); return; }
+    if (pin.length < PIN_LENGTH) { setPinError(`PIN must be exactly ${PIN_LENGTH} digits.`); return; }
     setPinSetupStep('confirm');
     setPinConfirm('');
     setPinError(null);
@@ -723,7 +723,7 @@ export default function App() {
               {pinSetupStep === 'enter' ? 'Create a PIN' : 'Confirm your PIN'}
             </h2>
             <p className="text-xs text-neutral-500 mt-1">
-              {pinSetupStep === 'enter' ? 'Choose a 4-digit PIN for your new wallet.' : 'Re-enter your PIN to confirm.'}
+              {pinSetupStep === 'enter' ? `Choose a ${PIN_LENGTH}-digit PIN for your new wallet.` : 'Re-enter your PIN to confirm.'}
             </p>
           </div>
           <PinInput
