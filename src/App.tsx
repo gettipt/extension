@@ -40,6 +40,7 @@ type WalletTransfer = Record<string, unknown>;
 interface BrowserStorageArea {
   get: (keys: string[], callback: (items: Record<string, unknown>) => void) => void;
   set: (items: Record<string, string>, callback?: () => void) => void;
+  remove?: (keys: string | string[], callback?: () => void) => void;
 }
 
 const PIN_KEY = 'spark_pin';
@@ -47,6 +48,10 @@ const WALLET_KEY = 'spark_wallet';
 const SENTINEL = 'spark_wallet_v1';
 const PIN_LENGTH = 5;
 const TRANSFERS_CACHE_KEY = 'spark_transfers_cache';
+
+function shouldSyncStorageKey(key: string) {
+  return key !== TRANSFERS_CACHE_KEY;
+}
 
 function getSyncStorage(): BrowserStorageArea | null {
   const browserLike = globalThis as typeof globalThis & {
@@ -62,8 +67,9 @@ function getSyncStorage(): BrowserStorageArea | null {
 
 async function getStoredItem(key: string): Promise<string | null> {
   const syncStorage = getSyncStorage();
+  const shouldSync = shouldSyncStorageKey(key);
 
-  if (syncStorage) {
+  if (syncStorage && shouldSync) {
     const syncValue = await new Promise<string | null>((resolve) => {
       syncStorage.get([key], (items) => {
         const value = items[key];
@@ -78,7 +84,7 @@ async function getStoredItem(key: string): Promise<string | null> {
   }
 
   const localValue = localStorage.getItem(key);
-  if (localValue && syncStorage) {
+  if (localValue && syncStorage && shouldSync) {
     await new Promise<void>((resolve) => {
       syncStorage.set({ [key]: localValue }, () => resolve());
     });
@@ -90,11 +96,26 @@ async function getStoredItem(key: string): Promise<string | null> {
 async function setStoredItem(key: string, value: string): Promise<void> {
   localStorage.setItem(key, value);
 
+  if (!shouldSyncStorageKey(key)) return;
+
   const syncStorage = getSyncStorage();
   if (!syncStorage) return;
 
   await new Promise<void>((resolve) => {
     syncStorage.set({ [key]: value }, () => resolve());
+  });
+}
+
+async function removeStoredItem(key: string): Promise<void> {
+  localStorage.removeItem(key);
+
+  if (!shouldSyncStorageKey(key)) return;
+
+  const syncStorage = getSyncStorage();
+  if (!syncStorage?.remove) return;
+
+  await new Promise<void>((resolve) => {
+    syncStorage.remove?.(key, () => resolve());
   });
 }
 
@@ -323,6 +344,24 @@ export default function App() {
   activePanelRef.current = activePanel;
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
 
+  const disposeWallet = useCallback(async (wallet: SparkWallet | null) => {
+    if (!wallet) return;
+
+    const walletWithCleanup = wallet as SparkWallet & {
+      cleanupConnections?: () => Promise<void>;
+    };
+
+    try {
+      if (typeof walletWithCleanup.cleanupConnections === 'function') {
+        await walletWithCleanup.cleanupConnections();
+      } else {
+        wallet.removeAllListeners();
+      }
+    } catch {
+      wallet.removeAllListeners();
+    }
+  }, []);
+
   const downloadBackupFile = useCallback(() => {
     if (!walletData) return;
     const blob = new Blob([walletData.mnemonic], { type: 'text/plain' });
@@ -380,8 +419,10 @@ export default function App() {
   }, []);
 
   useEffect(() => () => {
-    if (walletRef.current) walletRef.current.removeAllListeners();
-  }, []);
+    const wallet = walletRef.current;
+    walletRef.current = null;
+    void disposeWallet(wallet);
+  }, [disposeWallet]);
 
   const refreshBtcUsdRate = useCallback(async () => {
     try {
@@ -449,9 +490,8 @@ export default function App() {
 
   const subscribeToWalletEvents = useCallback((wallet: SparkWallet) => {
     // Clean up previous listeners if any
-    if (walletRef.current) {
-      walletRef.current.removeAllListeners();
-    }
+    const previousWallet = walletRef.current;
+    previousWallet?.removeAllListeners();
     walletRef.current = wallet;
 
     // Use only the definitive events that fire once with the final settled balance.
@@ -464,7 +504,7 @@ export default function App() {
     wallet.on('deposit:confirmed', (_depositId: string, updatedBalance: bigint) => {
       setWalletData((prev) => prev ? { ...prev, balanceSats: updatedBalance } : prev);
     });
-  }, []);
+  }, [disposeWallet]);
 
   const doInitWallet = async (
     mnemonicOrSeed: string | undefined,
@@ -472,6 +512,8 @@ export default function App() {
     recovered: boolean,
   ) => {
     try {
+      await disposeWallet(walletRef.current);
+      walletRef.current = null;
       cryptoKeyRef.current = key;
       // Decrypt cached transfers in parallel with wallet init
       const cachedTransfersPromise = (async () => {
@@ -628,6 +670,39 @@ export default function App() {
     setLnurlPayInfo(null);
     setSendError(null);
     setSendTxId(null);
+  };
+
+  const handleDeleteWalletAndReset = async () => {
+    const confirmed = globalThis.confirm('Clicking OK will delete your wallet and cannot be undone.');
+    if (!confirmed) return;
+
+    setShowSettingsMenu(false);
+
+    try {
+      await Promise.all([
+        removeStoredItem(PIN_KEY),
+        removeStoredItem(WALLET_KEY),
+        removeStoredItem(TRANSFERS_CACHE_KEY),
+      ]);
+
+      await disposeWallet(walletRef.current);
+      walletRef.current = null;
+
+      cryptoKeyRef.current = null;
+      setWalletData(null);
+      setRecentTransfers([]);
+      setInvoice(null);
+      setInvoiceCopied(false);
+      setActivePanel(null);
+      setPendingWalletAction(null);
+      setShowRecover(false);
+      setRecoverInput('');
+      setAppState('idle');
+
+      globalThis.location.reload();
+    } catch {
+      setWalletError('Failed to delete wallet data. Please try again.');
+    }
   };
 
   const handleResolveLnurl = async () => {
@@ -927,7 +1002,7 @@ export default function App() {
             }}
             className="w-full py-3 text-sm font-semibold rounded-xl bg-neutral-900 text-white hover:bg-neutral-700 active:bg-neutral-950 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 dark:active:bg-neutral-300"
           >
-            Download Backup File
+            Backup Wallet
           </button>
           <button
             onClick={() => setAppState('ready')}
@@ -966,7 +1041,15 @@ export default function App() {
                         }}
                         className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
                       >
-                        Download Backup File
+                        Backup Wallet
+                      </button>
+                      <button
+                        onClick={() => {
+                          void handleDeleteWalletAndReset();
+                        }}
+                        className="text-xs text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300"
+                      >
+                        Delete Wallet
                       </button>
                     </div>
                   </div>
