@@ -18,10 +18,20 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         background: path.resolve(__dirname, 'src/background.ts'),
+        content: path.resolve(__dirname, 'src/content.ts'),
+        'page-hook': path.resolve(__dirname, 'src/page-hook.ts'),
       },
       output: {
         entryFileNames: (chunkInfo) => {
-          return chunkInfo.name === 'background' ? '[name].js' : 'assets/[name]-[hash].js';
+          if (
+            chunkInfo.name === 'background' ||
+            chunkInfo.name === 'content' ||
+            chunkInfo.name === 'page-hook'
+          ) {
+            return '[name].js';
+          }
+
+          return 'assets/[name]-[hash].js';
         },
         chunkFileNames: 'assets/[name]-[hash].js',
         assetFileNames: 'assets/[name]-[hash][extname]',

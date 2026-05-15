@@ -45,6 +45,7 @@ interface BrowserStorageArea {
 
 const PIN_KEY = 'spark_pin';
 const WALLET_KEY = 'spark_wallet';
+const SESSION_PIN_KEY = 'spark_session_pin';
 const SENTINEL = 'spark_wallet_v1';
 const PIN_LENGTH = 5;
 const TRANSFERS_CACHE_KEY = 'spark_transfers_cache';
@@ -63,6 +64,18 @@ function getSyncStorage(): BrowserStorageArea | null {
   };
 
   return browserLike.chrome?.storage?.sync ?? null;
+}
+
+function getSessionStorage(): BrowserStorageArea | null {
+  const browserLike = globalThis as typeof globalThis & {
+    chrome?: {
+      storage?: {
+        session?: BrowserStorageArea;
+      };
+    };
+  };
+
+  return browserLike.chrome?.storage?.session ?? null;
 }
 
 async function getStoredItem(key: string): Promise<string | null> {
@@ -116,6 +129,36 @@ async function removeStoredItem(key: string): Promise<void> {
 
   await new Promise<void>((resolve) => {
     syncStorage.remove?.(key, () => resolve());
+  });
+}
+
+async function getSessionItem(key: string): Promise<string | null> {
+  const sessionStorage = getSessionStorage();
+  if (!sessionStorage) return null;
+
+  return new Promise<string | null>((resolve) => {
+    sessionStorage.get([key], (items) => {
+      const value = items[key];
+      resolve(typeof value === 'string' ? value : null);
+    });
+  });
+}
+
+async function setSessionItem(key: string, value: string): Promise<void> {
+  const sessionStorage = getSessionStorage();
+  if (!sessionStorage) return;
+
+  await new Promise<void>((resolve) => {
+    sessionStorage.set({ [key]: value }, () => resolve());
+  });
+}
+
+async function removeSessionItem(key: string): Promise<void> {
+  const sessionStorage = getSessionStorage();
+  if (!sessionStorage?.remove) return;
+
+  await new Promise<void>((resolve) => {
+    sessionStorage.remove?.(key, () => resolve());
   });
 }
 
@@ -408,6 +451,27 @@ export default function App() {
 
     void (async () => {
       const storedWallet = await getStoredItem(WALLET_KEY);
+      const sessionPin = await getSessionItem(SESSION_PIN_KEY);
+
+      if (storedWallet && sessionPin) {
+        try {
+          const pinRaw = await getStoredItem(PIN_KEY);
+          if (!pinRaw) throw new Error('PIN_NOT_FOUND');
+
+          const { salt, verifier } = JSON.parse(pinRaw);
+          const key = await deriveKey(sessionPin, hexToBuf(salt));
+          const result = await decryptText(key, verifier.iv, verifier.ct);
+          if (result !== SENTINEL) throw new Error('WRONG_SESSION_PIN');
+
+          if (!cancelled) {
+            await afterUnlock(key);
+          }
+          return;
+        } catch {
+          await removeSessionItem(SESSION_PIN_KEY);
+        }
+      }
+
       if (!cancelled) {
         setAppState(storedWallet ? 'pin-lock' : 'idle');
       }
@@ -592,6 +656,7 @@ export default function App() {
       const key = await deriveKey(pinInput, salt);
       const verifier = await encryptText(key, SENTINEL);
       await setStoredItem(PIN_KEY, JSON.stringify({ salt: bufToHex(salt), verifier }));
+      await setSessionItem(SESSION_PIN_KEY, pinInput);
       setPinInput('');
       setPinConfirm('');
       setPinSetupStep('enter');
@@ -626,6 +691,7 @@ export default function App() {
       const key = await deriveKey(pin, hexToBuf(salt));
       const result = await decryptText(key, verifier.iv, verifier.ct);
       if (result !== SENTINEL) throw new Error('Wrong PIN.');
+      await setSessionItem(SESSION_PIN_KEY, pin);
       setPinInput('');
       await afterUnlock(key);
     } catch (err) {
@@ -683,6 +749,7 @@ export default function App() {
         removeStoredItem(PIN_KEY),
         removeStoredItem(WALLET_KEY),
         removeStoredItem(TRANSFERS_CACHE_KEY),
+        removeSessionItem(SESSION_PIN_KEY),
       ]);
 
       await disposeWallet(walletRef.current);
