@@ -14,7 +14,8 @@
     "128": "greyasterisk.png"
   },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "permissions": ["tabs", "storage", "webRequest"],
   "host_permissions": ["<all_urls>"],
