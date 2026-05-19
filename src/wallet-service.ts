@@ -105,11 +105,71 @@ const TERMINAL_FAILURE_STATUSES = new Set([
   'USER_TRANSFER_VALIDATION_FAILED',
 ]);
 
+const WALLET_IDLE_TIMEOUT_MS = 90_000;
+
+let cachedWallet: SparkWallet | null = null;
+let walletInitPromise: Promise<SparkWallet> | null = null;
+let walletIdleTimer: ReturnType<typeof setTimeout> | undefined;
+
+function touchWalletIdleTimer() {
+  if (walletIdleTimer !== undefined) {
+    clearTimeout(walletIdleTimer);
+  }
+
+  walletIdleTimer = setTimeout(() => {
+    const walletToDispose = cachedWallet;
+    cachedWallet = null;
+    walletInitPromise = null;
+    void disposeWallet(walletToDispose);
+  }, WALLET_IDLE_TIMEOUT_MS);
+}
+
+async function assertUnlockedSession(): Promise<void> {
+  const sessionPin = await getSessionString(SESSION_PIN_KEY);
+  if (!sessionPin) {
+    const walletToDispose = cachedWallet;
+    cachedWallet = null;
+    walletInitPromise = null;
+    if (walletIdleTimer !== undefined) {
+      clearTimeout(walletIdleTimer);
+      walletIdleTimer = undefined;
+    }
+    await disposeWallet(walletToDispose);
+    throw new Error('Wallet is locked. Open TIPT and unlock first.');
+  }
+}
+
+async function getOrCreateWallet(): Promise<SparkWallet> {
+  await assertUnlockedSession();
+
+  if (cachedWallet) {
+    touchWalletIdleTimer();
+    return cachedWallet;
+  }
+
+  if (!walletInitPromise) {
+    walletInitPromise = (async () => {
+      const mnemonic = await decryptMnemonicFromStorage();
+      const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic, options: { network: 'MAINNET' } });
+      cachedWallet = initialized.wallet;
+      touchWalletIdleTimer();
+      return initialized.wallet;
+    })();
+  }
+
+  try {
+    return await walletInitPromise;
+  } catch (error) {
+    walletInitPromise = null;
+    throw error;
+  }
+}
+
 async function pollForPreimage(
   wallet: SparkWallet,
   requestId: string,
   maxWaitMs = 60_000,
-  intervalMs = 1_500,
+  intervalMs = 750,
 ): Promise<string> {
   const deadline = Date.now() + maxWaitMs;
 
@@ -139,34 +199,28 @@ async function pollForPreimage(
 }
 
 export async function payInvoiceFromSession(invoice: string): Promise<{ preimage: string }> {
-  let wallet: SparkWallet | null = null;
+  const wallet = await getOrCreateWallet();
 
-  try {
-    const mnemonic = await decryptMnemonicFromStorage();
-    const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic, options: { network: 'MAINNET' } });
-    wallet = initialized.wallet;
+  const paymentResult = await wallet.payLightningInvoice({ invoice, maxFeeSats: 200 });
 
-    const paymentResult = await wallet.payLightningInvoice({ invoice, maxFeeSats: 200 });
-
-    // payLightningInvoice returns immediately after initiating. The preimage is
-    // populated asynchronously by the SSP; poll until it arrives or we time out.
-    const immediate = getResultString(paymentResult as unknown as Record<string, unknown>, [
-      'paymentPreimage',
-      'preimage',
-      'payment_preimage',
-    ]);
-    if (immediate) {
-      return { preimage: immediate };
-    }
-
-    const requestId = getResultString(paymentResult as unknown as Record<string, unknown>, ['id']);
-    if (!requestId) {
-      throw new Error('Payment initiated but no request ID returned to poll for preimage.');
-    }
-
-    const preimage = await pollForPreimage(wallet, requestId);
-    return { preimage };
-  } finally {
-    await disposeWallet(wallet);
+  // payLightningInvoice returns immediately after initiating. The preimage is
+  // populated asynchronously by the SSP; poll until it arrives or we time out.
+  const immediate = getResultString(paymentResult as unknown as Record<string, unknown>, [
+    'paymentPreimage',
+    'preimage',
+    'payment_preimage',
+  ]);
+  if (immediate) {
+    touchWalletIdleTimer();
+    return { preimage: immediate };
   }
+
+  const requestId = getResultString(paymentResult as unknown as Record<string, unknown>, ['id']);
+  if (!requestId) {
+    throw new Error('Payment initiated but no request ID returned to poll for preimage.');
+  }
+
+  const preimage = await pollForPreimage(wallet, requestId);
+  touchWalletIdleTimer();
+  return { preimage };
 }

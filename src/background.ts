@@ -13,6 +13,8 @@ const GREY_ICON = 'greyasterisk.png';
 const GREEN_ICON = 'greenasterisk.png';
 const ALLOWLIST_KEY = 'tipt_402_allowlist';
 const tabsWith402 = new Set<number>();
+let allowlistCache: Record<string, true> | null = null;
+let allowlistLoadPromise: Promise<Record<string, true>> | null = null;
 
 interface ChallengePayload {
   scheme: string;
@@ -56,10 +58,20 @@ function getHostFromUrl(rawUrl: string): string | null {
 }
 
 async function getAllowlist(): Promise<Record<string, true>> {
+  if (allowlistCache) {
+    return allowlistCache;
+  }
+
+  if (allowlistLoadPromise) {
+    return allowlistLoadPromise;
+  }
+
+  allowlistLoadPromise = (async () => {
   const result = await chrome.storage.local.get([ALLOWLIST_KEY]);
   const raw = result[ALLOWLIST_KEY];
   if (!raw || typeof raw !== 'object') {
-    return {};
+      allowlistCache = {};
+      return allowlistCache;
   }
 
   const list: Record<string, true> = {};
@@ -68,12 +80,21 @@ async function getAllowlist(): Promise<Record<string, true>> {
       list[key] = true;
     }
   }
-  return list;
+    allowlistCache = list;
+    return allowlistCache;
+  })();
+
+  try {
+    return await allowlistLoadPromise;
+  } finally {
+    allowlistLoadPromise = null;
+  }
 }
 
 async function rememberHost(host: string): Promise<void> {
   const list = await getAllowlist();
   list[host] = true;
+  allowlistCache = list;
   await chrome.storage.local.set({ [ALLOWLIST_KEY]: list });
 }
 
@@ -81,6 +102,30 @@ async function isHostRemembered(host: string): Promise<boolean> {
   const list = await getAllowlist();
   return list[host] === true;
 }
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') {
+    return;
+  }
+
+  if (!(ALLOWLIST_KEY in changes)) {
+    return;
+  }
+
+  const newValue = changes[ALLOWLIST_KEY]?.newValue;
+  if (!newValue || typeof newValue !== 'object') {
+    allowlistCache = {};
+    return;
+  }
+
+  const parsed: Record<string, true> = {};
+  for (const [key, value] of Object.entries(newValue as Record<string, unknown>)) {
+    if (value === true) {
+      parsed[key] = true;
+    }
+  }
+  allowlistCache = parsed;
+});
 
 function toBase64UrlUtf8(value: string): string {
   const bytes = new TextEncoder().encode(value);

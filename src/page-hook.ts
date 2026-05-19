@@ -457,9 +457,11 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
 
     const response = await originalFetch(...args);
 
+    const hasHeaderChallenge = hasPaymentChallengeHeader(response.headers);
     const isJson = (response.headers.get('content-type')?.toLowerCase() ?? '').includes('application/json');
+    const shouldInspectBody = response.status === 402 || hasHeaderChallenge || response.status >= 400;
     let body: unknown = null;
-    if (isJson) {
+    if (isJson && shouldInspectBody) {
       try {
         body = await response.clone().json();
       } catch {
@@ -467,7 +469,6 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
       }
     }
 
-    const hasHeaderChallenge = hasPaymentChallengeHeader(response.headers);
     const bodySignals402 = bodyLooksLikePaymentRequired(body);
     const challenge = challengeFromResponse(response.headers, body);
 
@@ -614,7 +615,8 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
         let bodySignals402 = false;
         let parsedBody: unknown = null;
         const responseType = this.responseType;
-        if (responseType === '' || responseType === 'text') {
+        const shouldInspectBody = this.status === 402 || hasChallengeHeader || this.status >= 400;
+        if (shouldInspectBody && (responseType === '' || responseType === 'text')) {
           try {
             parsedBody = JSON.parse(this.responseText) as unknown;
             bodySignals402 = bodyLooksLikePaymentRequired(parsedBody);
@@ -632,11 +634,12 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
             status: this.status,
           });
 
+          const bodyInvoice = parsedBody ? extractInvoiceFromBody(parsedBody) : null;
           const challenge = parseChallengeHeader(responseHeader)
-            ?? (extractInvoiceFromBody(parsedBody)
+            ?? (bodyInvoice
               ? {
                 scheme: 'L402',
-                invoice: extractInvoiceFromBody(parsedBody) as string,
+                invoice: bodyInvoice,
               }
               : null);
 
