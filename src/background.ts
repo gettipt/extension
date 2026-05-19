@@ -1,6 +1,12 @@
 /// <reference types="chrome" />
 import { payInvoiceFromSession } from './wallet-service';
 
+// Service workers don't expose `window`. Polyfill it so any SDK code that
+// uses `window.X` inside async callbacks (not guarded by typeof checks) works correctly.
+if (typeof window === 'undefined') {
+  (globalThis as unknown as Record<string, unknown>).window = globalThis;
+}
+
 // Background service worker for icon switching based on 402 responses.
 
 const GREY_ICON = 'greyasterisk.png';
@@ -21,6 +27,7 @@ interface ChallengePayload {
     intent: string;
     request: string;
     expires?: string;
+    opaque?: string;
   };
 }
 
@@ -85,6 +92,39 @@ function toBase64UrlUtf8(value: string): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+// RFC 8785 JSON Canonicalization Scheme: sorts object keys lexicographically (Unicode code point order)
+function jcsStringify(value: unknown): string {
+  if (value === null) return 'null';
+  if (typeof value === 'boolean' || typeof value === 'number') return JSON.stringify(value);
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(jcsStringify).join(',') + ']';
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    const pairs = Object.keys(obj)
+      .sort()
+      .map(k => JSON.stringify(k) + ':' + jcsStringify(obj[k]));
+    return '{' + pairs.join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+function decodeOpaqueToObject(opaque: string): Record<string, string> | undefined {
+  try {
+    // The opaque is base64url-encoded JSON. Older mppx server versions expect
+    // the decoded object in the credential echo, not the raw base64url string.
+    const json = atob(opaque.replace(/-/g, '+').replace(/_/g, '/').padEnd(
+      opaque.length + (4 - opaque.length % 4) % 4, '=',
+    ));
+    const parsed = JSON.parse(json);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+  } catch {
+    // If decode fails, fall back to omitting opaque
+  }
+  return undefined;
+}
+
 function buildAuthorizationValue(challenge: ChallengePayload, preimage: string): string | null {
   const scheme = challenge.scheme?.trim() || 'L402';
   if (scheme.toLowerCase() === 'payment') {
@@ -93,13 +133,21 @@ function buildAuthorizationValue(challenge: ChallengePayload, preimage: string):
       return null;
     }
 
-    const challengeEcho = {
+    // Decode opaque from base64url to its JSON object. Older server-side mppx
+    // versions expect the opaque as an object (legacy format) rather than the
+    // spec-compliant base64url string introduced in newer versions.
+    const opaqueObj = paymentChallenge.opaque
+      ? decodeOpaqueToObject(paymentChallenge.opaque)
+      : undefined;
+
+    const challengeEcho: Record<string, unknown> = {
       id: paymentChallenge.id,
       realm: paymentChallenge.realm,
       method: paymentChallenge.method,
       intent: paymentChallenge.intent,
       request: paymentChallenge.request,
       ...(paymentChallenge.expires ? { expires: paymentChallenge.expires } : {}),
+      ...(opaqueObj ? { opaque: opaqueObj } : {}),
     };
 
     const credential = {
@@ -109,7 +157,9 @@ function buildAuthorizationValue(challenge: ChallengePayload, preimage: string):
       },
     };
 
-    return `Payment ${toBase64UrlUtf8(JSON.stringify(credential))}`;
+    const credentialJson = jcsStringify(credential);
+    console.log('[TIPT-BG] Payment credential JSON (JCS):', credentialJson);
+    return `Payment ${toBase64UrlUtf8(credentialJson)}`;
   }
 
   if (scheme.toLowerCase() === 'l402') {
@@ -195,7 +245,7 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
   try {
     console.log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
     const payment = await payInvoiceFromSession(invoice);
-    console.log('[TIPT-BG] Payment successful, preimage:', payment.preimage.slice(0, 20));
+    console.log('[TIPT-BG] Payment successful, preimage:', payment.preimage, '(len:', payment.preimage.length, ')');
 
     const authorization = buildAuthorizationValue(payload.challenge, payment.preimage);
     if (!authorization) {

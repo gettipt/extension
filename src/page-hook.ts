@@ -16,6 +16,7 @@ interface ChallengePayload {
     intent: string;
     request: string;
     expires?: string;
+    opaque?: string;
   };
 }
 
@@ -62,8 +63,30 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
     return wwwAuth.includes('payment') || wwwAuth.includes('invoice') || wwwAuth.includes('challenge') || wwwAuth.includes('l402');
   };
 
+  // Wrap Headers.get() to suppress "Refused to get unsafe header" browser warnings
+  // for CORS-restricted headers like www-authenticate.
+  const safeGetHeader = (headers: Headers, name: string): string | null => {
+    try {
+      return headers.get(name);
+    } catch {
+      return null;
+    }
+  };
+
+  // Parse a header value from the raw string returned by getAllResponseHeaders()
+  // to avoid triggering browser "unsafe header" warnings via getResponseHeader().
+  const parseHeaderFromRaw = (rawHeaders: string, headerName: string): string | null => {
+    const prefix = headerName.toLowerCase() + ':';
+    for (const line of rawHeaders.split('\r\n')) {
+      if (line.toLowerCase().startsWith(prefix)) {
+        return line.slice(prefix.length).trim();
+      }
+    }
+    return null;
+  };
+
   const hasPaymentChallengeHeader = (headers: Headers): boolean => {
-    return hasPaymentChallengeHeaderText(headers.get('www-authenticate') ?? '');
+    return hasPaymentChallengeHeaderText(safeGetHeader(headers, 'www-authenticate') ?? '');
   };
 
   const decodeBase64UrlJson = (value: string): Record<string, unknown> | null => {
@@ -192,6 +215,7 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
           intent: params.intent,
           request: requestToken,
           expires: params.expires,
+          opaque: params.opaque,
         }
         : undefined;
 
@@ -345,7 +369,7 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
   };
 
   const challengeFromResponse = (headers: Headers, body: unknown): ChallengePayload | null => {
-    const fromHeader = parseChallengeHeader(headers.get('www-authenticate'));
+    const fromHeader = parseChallengeHeader(safeGetHeader(headers, 'www-authenticate'));
     if (fromHeader) {
       return fromHeader;
     }
@@ -470,9 +494,21 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
         console.log('[TIPT-PH] Fetch payment result:', paymentResult);
         if (paymentResult.approved && paymentResult.authorization) {
           console.log('[TIPT-PH] Fetch: retrying with authorization');
+          // Decode and log the credential for debugging
+          try {
+            const tokenPart = paymentResult.authorization.split(' ')[1] ?? '';
+            const pad = tokenPart + '='.repeat((4 - tokenPart.length % 4) % 4);
+            const decoded = atob(pad.replace(/-/g, '+').replace(/_/g, '/'));
+            console.log('[TIPT-PH] Credential JSON:', decoded);
+          } catch { /* ignore */ }
+
           const retryArgs = buildFetchRetryArgs(args, requestClone, paymentResult.authorization);
           if (retryArgs) {
-            return originalFetch(...retryArgs);
+            const retryResponse = await originalFetch(...retryArgs);
+            let retryBody: string | null = null;
+            try { retryBody = await retryResponse.clone().text(); } catch { /* ignore */ }
+            console.log('[TIPT-PH] Retry response status:', retryResponse.status, 'body:', retryBody);
+            return retryResponse;
           }
         }
       } else {
@@ -567,10 +603,13 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
       this.__tiptLoadendInstalled = true;
 
       this.addEventListener('loadend', function (this: TiptPatchedXhr) {
-        const headersRaw = this.getAllResponseHeaders().toLowerCase();
-        const responseHeader = this.getResponseHeader('www-authenticate');
+        const rawHeaders = this.getAllResponseHeaders();
+        const headersRaw = rawHeaders.toLowerCase();
         const hasChallengeHeader = headersRaw.includes('www-authenticate:') &&
           (headersRaw.includes('payment') || headersRaw.includes('invoice') || headersRaw.includes('challenge') || headersRaw.includes('l402'));
+
+        // Only parse www-authenticate when we know it's present — avoids "unsafe header" browser warning.
+        const responseHeader = hasChallengeHeader ? parseHeaderFromRaw(rawHeaders, 'www-authenticate') : null;
 
         let bodySignals402 = false;
         let parsedBody: unknown = null;

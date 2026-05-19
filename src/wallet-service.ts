@@ -99,20 +99,72 @@ async function decryptMnemonicFromStorage(): Promise<string> {
   return decryptText(key, walletPayload.iv, walletPayload.ct);
 }
 
+const TERMINAL_FAILURE_STATUSES = new Set([
+  'LIGHTNING_PAYMENT_FAILED',
+  'PREIMAGE_PROVIDING_FAILED',
+  'USER_TRANSFER_VALIDATION_FAILED',
+]);
+
+async function pollForPreimage(
+  wallet: SparkWallet,
+  requestId: string,
+  maxWaitMs = 60_000,
+  intervalMs = 1_500,
+): Promise<string> {
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+
+    const req = await (wallet as unknown as {
+      getLightningSendRequest: (id: string) => Promise<Record<string, unknown> | null>;
+    }).getLightningSendRequest(requestId);
+
+    if (!req) {
+      continue;
+    }
+
+    const preimage = getResultString(req, ['paymentPreimage', 'preimage', 'payment_preimage']);
+    if (preimage) {
+      return preimage;
+    }
+
+    const status = typeof req.status === 'string' ? req.status : '';
+    if (TERMINAL_FAILURE_STATUSES.has(status)) {
+      throw new Error(`Lightning payment failed with status: ${status}`);
+    }
+  }
+
+  throw new Error('Timed out waiting for payment preimage.');
+}
+
 export async function payInvoiceFromSession(invoice: string): Promise<{ preimage: string }> {
   let wallet: SparkWallet | null = null;
 
   try {
     const mnemonic = await decryptMnemonicFromStorage();
-    const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic });
+    const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic, options: { network: 'MAINNET' } });
     wallet = initialized.wallet;
 
     const paymentResult = await wallet.payLightningInvoice({ invoice, maxFeeSats: 200 });
-    const preimage = getResultString(paymentResult, ['preimage', 'paymentPreimage', 'payment_preimage']);
-    if (!preimage) {
-      throw new Error('Payment succeeded but no preimage was returned.');
+
+    // payLightningInvoice returns immediately after initiating. The preimage is
+    // populated asynchronously by the SSP; poll until it arrives or we time out.
+    const immediate = getResultString(paymentResult as unknown as Record<string, unknown>, [
+      'paymentPreimage',
+      'preimage',
+      'payment_preimage',
+    ]);
+    if (immediate) {
+      return { preimage: immediate };
     }
 
+    const requestId = getResultString(paymentResult as unknown as Record<string, unknown>, ['id']);
+    if (!requestId) {
+      throw new Error('Payment initiated but no request ID returned to poll for preimage.');
+    }
+
+    const preimage = await pollForPreimage(wallet, requestId);
     return { preimage };
   } finally {
     await disposeWallet(wallet);
