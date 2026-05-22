@@ -1,20 +1,15 @@
 /// <reference types="chrome" />
-import { payInvoiceFromSession } from './wallet-service';
-
-// Service workers don't expose `window`. Polyfill it so any SDK code that
-// uses `window.X` inside async callbacks (not guarded by typeof checks) works correctly.
-if (typeof window === 'undefined') {
-  (globalThis as unknown as Record<string, unknown>).window = globalThis;
-}
 
 // Background service worker for icon switching based on 402 responses.
 
 const GREY_ICON = 'greyasterisk.png';
 const GREEN_ICON = 'greenasterisk.png';
 const ALLOWLIST_KEY = 'tipt_402_allowlist';
+const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 const tabsWith402 = new Set<number>();
 let allowlistCache: Record<string, true> | null = null;
 let allowlistLoadPromise: Promise<Record<string, true>> | null = null;
+let offscreenInitPromise: Promise<void> | null = null;
 
 interface ChallengePayload {
   scheme: string;
@@ -43,6 +38,12 @@ interface PayRequestPayload {
 interface PromptResponse {
   approved: boolean;
   remember?: boolean;
+}
+
+interface OffscreenPayResponse {
+  ok: boolean;
+  preimage?: string;
+  error?: string;
 }
 
 function getStringValue(data: unknown): string | null {
@@ -243,6 +244,64 @@ function promptForPaymentApproval(tabId: number, payload: PayRequestPayload, hos
   });
 }
 
+async function ensureOffscreenDocument(): Promise<void> {
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error('Offscreen documents are not supported in this Chrome runtime.');
+  }
+
+  if (!offscreenInitPromise) {
+    offscreenInitPromise = (async () => {
+      if (chrome.offscreen.hasDocument) {
+        const hasDocument = await chrome.offscreen.hasDocument();
+        if (hasDocument) {
+          return;
+        }
+      }
+
+      try {
+        await chrome.offscreen.createDocument({
+          url: OFFSCREEN_DOCUMENT_PATH,
+          reasons: ['LOCAL_STORAGE'],
+          justification: 'Process Spark SDK invoice payments outside the service worker runtime.',
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes('Only a single offscreen document may be created')) {
+          throw error;
+        }
+      }
+    })().finally(() => {
+      offscreenInitPromise = null;
+    });
+  }
+
+  await offscreenInitPromise;
+}
+
+function requestPreimageFromOffscreen(invoice: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: 'TIPT_OFFSCREEN_PAY_INVOICE',
+        payload: { invoice },
+      },
+      (response: OffscreenPayResponse) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+
+        if (!response?.ok || !response.preimage) {
+          reject(new Error(response?.error ?? 'Offscreen payment failed.'));
+          return;
+        }
+
+        resolve(response.preimage);
+      },
+    );
+  });
+}
+
 async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrome.runtime.MessageSender) {
   console.log('[TIPT-BG] Handling 402 payment request');
   const invoice = getStringValue(payload?.challenge?.invoice);
@@ -289,10 +348,11 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
 
   try {
     console.log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
-    const payment = await payInvoiceFromSession(invoice);
-    console.log('[TIPT-BG] Payment successful, preimage:', payment.preimage, '(len:', payment.preimage.length, ')');
+    await ensureOffscreenDocument();
+    const preimage = await requestPreimageFromOffscreen(invoice);
+    console.log('[TIPT-BG] Payment successful, preimage:', preimage, '(len:', preimage.length, ')');
 
-    const authorization = buildAuthorizationValue(payload.challenge, payment.preimage);
+    const authorization = buildAuthorizationValue(payload.challenge, preimage);
     if (!authorization) {
       return { approved: false, error: 'Missing Payment challenge fields for MPP credential retry.' };
     }

@@ -17,6 +17,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: path.resolve(__dirname, 'index.html'),
+        offscreen: path.resolve(__dirname, 'offscreen.html'),
         background: path.resolve(__dirname, 'src/background.ts'),
         content: path.resolve(__dirname, 'src/content.ts'),
         'page-hook': path.resolve(__dirname, 'src/page-hook.ts'),
