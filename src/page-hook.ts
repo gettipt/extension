@@ -54,6 +54,18 @@ const win = window as TiptWindow;
 if (!win.__TIPT_402_HOOK_INSTALLED__) {
   win.__TIPT_402_HOOK_INSTALLED__ = true;
 
+  const announcement = {
+    name: 'TIPT',
+    version: '0.0.0',
+    capabilities: ['l402', 'lightning-invoice'],
+  };
+
+  window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
+
+  window.addEventListener('mpp:request', () => {
+    window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
+  });
+
   const report402 = (payload?: Record<string, unknown>) => {
     window.postMessage({ type: BRIDGE_EVENT, payload }, '*');
   };
