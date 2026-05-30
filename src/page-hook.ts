@@ -1,6 +1,7 @@
 const BRIDGE_EVENT = 'TIPT_PAGE_402';
 const PAYMENT_REQUEST_EVENT = 'TIPT_402_PAYMENT_REQUEST';
 const PAYMENT_RESPONSE_EVENT = 'TIPT_402_PAYMENT_RESPONSE';
+const MPP_REQUEST_TRIGGERED_EVENT = 'TIPT_MPP_REQUEST_TRIGGERED';
 const RETRY_HEADER = 'x-tipt-402-retry';
 
 interface ChallengePayload {
@@ -63,6 +64,7 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
   window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
 
   window.addEventListener('mpp:request', () => {
+    window.postMessage({ type: MPP_REQUEST_TRIGGERED_EVENT }, '*');
     window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
   });
 
@@ -267,7 +269,7 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
         if (nestedInvoice) {
           return nestedInvoice;
         }
-      } catch (e) {
+      } catch {
         console.log('[TIPT-PH] extractInvoiceFromBody: failed to parse nested body string');
       }
     } else if (data.body && typeof data.body === 'object') {
@@ -655,7 +657,7 @@ if (!win.__TIPT_402_HOOK_INSTALLED__) {
               }
               : null);
 
-          console.log('[TIPT-PH] XHR challenge parsed:', !!challenge?.invoice ? challenge.invoice.slice(0, 20) : 'no invoice');
+          console.log('[TIPT-PH] XHR challenge parsed:', challenge?.invoice ? challenge.invoice.slice(0, 20) : 'no invoice');
           if (!this.__tiptRetried && challenge?.invoice) {
             console.log('[TIPT-PH] XHR: requesting payment for invoice:', challenge.invoice.slice(0, 20));
             void retryXmlHttpRequest(this, challenge);

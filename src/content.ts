@@ -3,6 +3,7 @@
 const BRIDGE_EVENT = 'TIPT_PAGE_402';
 const PAYMENT_REQUEST_EVENT = 'TIPT_402_PAYMENT_REQUEST';
 const PAYMENT_RESPONSE_EVENT = 'TIPT_402_PAYMENT_RESPONSE';
+const MPP_REQUEST_TRIGGERED_EVENT = 'TIPT_MPP_REQUEST_TRIGGERED';
 
 interface PagePaymentRequest {
   requestId: string;
@@ -30,6 +31,11 @@ function handleBridgeEvent(event: MessageEvent) {
   if (data.type === BRIDGE_EVENT) {
     console.log('[TIPT-CS] Bridge event received: 402 detected');
     chrome.runtime.sendMessage({ type: 'PAGE_402_DETECTED', payload: data.payload ?? null });
+    return;
+  }
+
+  if (data.type === MPP_REQUEST_TRIGGERED_EVENT) {
+    chrome.runtime.sendMessage({ type: MPP_REQUEST_TRIGGERED_EVENT });
     return;
   }
 
