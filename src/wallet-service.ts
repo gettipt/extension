@@ -198,10 +198,32 @@ async function pollForPreimage(
   throw new Error('Timed out waiting for payment preimage.');
 }
 
+function getRecommendedMaxFeeSats(amountSats: number): number {
+  return Math.max(5, Math.ceil(amountSats * 0.0017));
+}
+
 export async function payInvoiceFromSession(invoice: string): Promise<{ preimage: string }> {
   const wallet = await getOrCreateWallet();
 
-  const paymentResult = await wallet.payLightningInvoice({ invoice, maxFeeSats: 200 });
+  let maxFeeSats = 50; // conservative fallback
+  try {
+    const feeEstimate = await (wallet as unknown as {
+      getLightningSendFeeEstimate: (params: { encodedInvoice: string }) => Promise<Record<string, unknown>>;
+    }).getLightningSendFeeEstimate({ encodedInvoice: invoice });
+
+    const estimatedFee = feeEstimate?.feeEstimate ?? feeEstimate?.fee ?? feeEstimate?.estimatedFee;
+    const amountSats = feeEstimate?.amountSats ?? feeEstimate?.amount;
+
+    if (typeof estimatedFee === 'number' && Number.isFinite(estimatedFee)) {
+      maxFeeSats = Math.max(5, estimatedFee);
+    } else if (typeof amountSats === 'number' && Number.isFinite(amountSats)) {
+      maxFeeSats = getRecommendedMaxFeeSats(amountSats);
+    }
+  } catch {
+    // Fee estimate unavailable; proceed with fallback.
+  }
+
+  const paymentResult = await wallet.payLightningInvoice({ invoice, maxFeeSats });
 
   // payLightningInvoice returns immediately after initiating. The preimage is
   // populated asynchronously by the SSP; poll until it arrives or we time out.

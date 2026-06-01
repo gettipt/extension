@@ -163,14 +163,14 @@ async function removeSessionItem(key: string): Promise<void> {
 }
 
 function getMaxFeeSats(amountSats: number) {
-  return Math.max(10, Math.ceil(amountSats * 0.01));
+  return Math.max(5, Math.ceil(amountSats * 0.0017));
 }
 
 function getMaxSpendableSats(balanceSats: number) {
-  if (balanceSats <= 10) return 0;
+  if (balanceSats <= 5) return 0;
 
-  let candidate = Math.max(0, Math.floor((balanceSats * 100) / 101));
-  candidate = Math.min(candidate, balanceSats - 10);
+  let candidate = Math.max(0, Math.floor((balanceSats * 10000) / 10017));
+  candidate = Math.min(candidate, balanceSats - 5);
 
   while (candidate > 0 && candidate + getMaxFeeSats(candidate) > balanceSats) {
     candidate -= 1;

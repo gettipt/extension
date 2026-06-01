@@ -20,14 +20,12 @@ export default defineConfig({
         offscreen: path.resolve(__dirname, 'offscreen.html'),
         background: path.resolve(__dirname, 'src/background.ts'),
         content: path.resolve(__dirname, 'src/content.ts'),
-        'page-hook': path.resolve(__dirname, 'src/page-hook.ts'),
       },
       output: {
         entryFileNames: (chunkInfo) => {
           if (
             chunkInfo.name === 'background' ||
-            chunkInfo.name === 'content' ||
-            chunkInfo.name === 'page-hook'
+            chunkInfo.name === 'content'
           ) {
             return '[name].js';
           }

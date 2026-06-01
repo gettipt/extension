@@ -1,14 +1,35 @@
 /// <reference types="chrome" />
 
-const BRIDGE_EVENT = 'TIPT_PAGE_402';
-const PAYMENT_REQUEST_EVENT = 'TIPT_402_PAYMENT_REQUEST';
-const PAYMENT_RESPONSE_EVENT = 'TIPT_402_PAYMENT_RESPONSE';
 const MPP_REQUEST_TRIGGERED_EVENT = 'TIPT_MPP_REQUEST_TRIGGERED';
 
-interface PagePaymentRequest {
+interface MppPayDetail {
   requestId: string;
-  payload: Record<string, unknown>;
+  invoice: string;
+  scheme?: string;
+  macaroon?: string;
+  token?: string;
+  paymentChallenge?: {
+    id: string;
+    realm: string;
+    method: string;
+    intent: string;
+    request: string;
+    expires?: string;
+    opaque?: string;
+  };
 }
+
+interface PayResponse {
+  approved: boolean;
+  authorization?: string;
+  error?: string;
+}
+
+const announcement = {
+  name: 'TIPT',
+  version: '0.0.0',
+  capabilities: ['l402', 'lightning-invoice'],
+};
 
 function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -22,65 +43,59 @@ function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
   });
 }
 
-function handleBridgeEvent(event: MessageEvent) {
-  if (event.source !== window) return;
+// Announce wallet presence to the page.
+window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
 
-  const data = event.data;
-  if (!data || typeof data !== 'object') return;
+// Re-announce and notify background (icon badge) when the page asks.
+window.addEventListener('mpp:request', () => {
+  chrome.runtime.sendMessage({ type: MPP_REQUEST_TRIGGERED_EVENT });
+  window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
+});
 
-  if (data.type === BRIDGE_EVENT) {
-    console.log('[TIPT-CS] Bridge event received: 402 detected');
-    chrome.runtime.sendMessage({ type: 'PAGE_402_DETECTED', payload: data.payload ?? null });
+// Handle payment requests dispatched by the page.
+window.addEventListener('mpp:pay', (event: Event) => {
+  const detail = (event as CustomEvent<MppPayDetail>).detail;
+  if (!detail?.requestId || !detail?.invoice) {
+    console.log('[TIPT-CS] mpp:pay received with missing requestId or invoice');
     return;
   }
 
-  if (data.type === MPP_REQUEST_TRIGGERED_EVENT) {
-    chrome.runtime.sendMessage({ type: MPP_REQUEST_TRIGGERED_EVENT });
-    return;
-  }
+  console.log('[TIPT-CS] mpp:pay received, requestId:', detail.requestId);
 
-  if (data.type !== PAYMENT_REQUEST_EVENT) return;
-
-  const request = data as PagePaymentRequest;
-  if (typeof request.requestId !== 'string' || !request.payload) {
-    console.log('[TIPT-CS] Invalid payment request event');
-    return;
-  }
-
-  console.log('[TIPT-CS] Payment request received, forwarding to background, requestId:', request.requestId);
-  void sendRuntimeMessage<Record<string, unknown>>({
+  void sendRuntimeMessage<PayResponse>({
     type: 'TIPT_402_PAY_REQUEST',
-    payload: request.payload,
+    payload: {
+      source: 'mpp',
+      url: window.location.href,
+      method: 'GET',
+      challenge: {
+        scheme: detail.scheme ?? 'L402',
+        invoice: detail.invoice,
+        macaroon: detail.macaroon,
+        token: detail.token,
+        paymentChallenge: detail.paymentChallenge,
+      },
+    },
   })
     .then((response) => {
-      console.log('[TIPT-CS] Background response received:', response);
-      window.postMessage({
-        type: PAYMENT_RESPONSE_EVENT,
-        requestId: request.requestId,
-        response,
-      }, '*');
+      console.log('[TIPT-CS] Payment response:', response);
+      window.dispatchEvent(new CustomEvent('mpp:payresponse', {
+        detail: {
+          requestId: detail.requestId,
+          approved: response.approved,
+          authorization: response.authorization,
+          error: response.error,
+        },
+      }));
     })
     .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : 'Payment request failed.';
-      console.log('[TIPT-CS] Background request failed:', message);
-      window.postMessage({
-        type: PAYMENT_RESPONSE_EVENT,
-        requestId: request.requestId,
-        response: { approved: false, error: message },
-      }, '*');
+      const message = error instanceof Error ? error.message : 'Payment failed.';
+      console.log('[TIPT-CS] Payment error:', message);
+      window.dispatchEvent(new CustomEvent('mpp:payresponse', {
+        detail: { requestId: detail.requestId, approved: false, error: message },
+      }));
     });
-}
-
-function injectPageHook() {
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('page-hook.js');
-
-  (document.head || document.documentElement).appendChild(script);
-  script.remove();
-}
-
-window.addEventListener('message', handleBridgeEvent);
-injectPageHook();
+});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'TIPT_PROMPT_402_PAYMENT') {

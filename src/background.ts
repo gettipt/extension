@@ -28,7 +28,7 @@ interface ChallengePayload {
 }
 
 interface PayRequestPayload {
-  source: 'fetch' | 'xhr';
+  source: 'fetch' | 'xhr' | 'mpp';
   url: string;
   method: string;
   challenge: ChallengePayload;
