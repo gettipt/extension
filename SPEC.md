@@ -184,6 +184,30 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
   Page JS
 ```
 
+### Background ↔ Offscreen relationship
+
+The background service worker and the offscreen document have distinct capabilities and a deliberate division of responsibility:
+
+| Concern | Background (`background.ts`) | Offscreen (`wallet-service.ts`) |
+|---|---|---|
+| `chrome.storage` access | ✅ Full access | ❌ Not available |
+| `chrome.runtime` messaging | ✅ | ✅ (only API available) |
+| Spark SDK / WASM | ❌ Service workers can't run WASM reliably | ✅ Runs in a document context |
+| Wallet lifecycle | ❌ | ✅ Caches wallet instance, 90 s idle teardown |
+
+Because the offscreen document cannot access `chrome.storage`, the background is responsible for reading all credentials before delegating. The `TIPT_OFFSCREEN_PAY_INVOICE` message carries:
+
+```ts
+{
+  invoice: string,      // BOLT11 to pay
+  sessionPin: string,   // from chrome.storage.session
+  pinRaw: string,       // from chrome.storage.sync (salt + encrypted verifier)
+  walletRaw: string,    // from chrome.storage.sync (encrypted mnemonic)
+}
+```
+
+The offscreen decrypts the mnemonic from those values using PBKDF2 + AES-GCM (the same scheme used by the popup), initialises or reuses a cached `SparkWallet` instance, and pays the invoice. The preimage (or error) is returned synchronously via `sendResponse`.
+
 ---
 
 ## Manifest
