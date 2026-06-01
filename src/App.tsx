@@ -584,6 +584,12 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refreshBtcUsdRate]);
 
+  useEffect(() => {
+    if (sendStep !== 'success') return;
+    const timer = setTimeout(() => handleSend(), 5000);
+    return () => clearTimeout(timer);
+  }, [sendStep]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const loadTransfers = useCallback(async (wallet: SparkWallet) => {
     setLoadingTransfers(true);
     setTransfersError(null);
@@ -1402,21 +1408,16 @@ export default function App() {
               )}
 
               {sendStep === 'success' && (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-3 p-3 rounded-lg bg-neutral-100 border border-neutral-300 dark:bg-neutral-800/50 dark:border-neutral-600/50">
-                    <div className="w-7 h-7 rounded-full bg-neutral-200 flex items-center justify-center shrink-0 dark:bg-neutral-700">
-                      <svg className="w-3.5 h-3.5 text-neutral-600 dark:text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-                      </svg>
-                    </div>
-                    <div>
-                      <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Payment sent!</p>
-                      {sendTxId && <p className="text-xs text-neutral-500 font-mono break-all mt-0.5">{sendTxId}</p>}
-                    </div>
+                <div className="flex items-center gap-3 p-3 rounded-lg bg-neutral-100 border border-neutral-300 dark:bg-neutral-800/50 dark:border-neutral-600/50">
+                  <div className="w-7 h-7 rounded-full bg-neutral-200 flex items-center justify-center shrink-0 dark:bg-neutral-700">
+                    <svg className="w-3.5 h-3.5 text-neutral-600 dark:text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                    </svg>
                   </div>
-                  <button onClick={handleSend} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600">
-                    Send another
-                  </button>
+                  <div>
+                    <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Payment sent!</p>
+                    {sendTxId && <p className="text-xs text-neutral-500 font-mono break-all mt-0.5">{sendTxId}</p>}
+                  </div>
                 </div>
               )}
 
