@@ -22,7 +22,7 @@ type AppState =
 
 type PinSetupStep = 'enter' | 'confirm';
 type ActivePanel = 'send' | 'receive' | null;
-type SendStep = 'input' | 'amount' | 'sending' | 'success' | 'error';
+type SendStep = 'input' | 'amount' | 'confirm' | 'sending' | 'success' | 'error';
 type PendingWalletAction =
   | { type: 'create' }
   | { type: 'recover'; mnemonic: string; fromFile?: boolean }
@@ -295,7 +295,13 @@ function PinInput({
   onSubmit?: (v: string) => void;
   disabled?: boolean;
 }) {
-  const refs = Array.from({ length: PIN_LENGTH }, () => useRef<HTMLInputElement>(null));
+  const refs = [
+    useRef<HTMLInputElement>(null),
+    useRef<HTMLInputElement>(null),
+    useRef<HTMLInputElement>(null),
+    useRef<HTMLInputElement>(null),
+    useRef<HTMLInputElement>(null),
+  ];
   const digits = value.split('').concat(Array(PIN_LENGTH).fill('')).slice(0, PIN_LENGTH);
 
   const handleKey = (i: number, e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -371,6 +377,9 @@ export default function App() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
   const [sendTxId, setSendTxId] = useState<string | null>(null);
+  const [isSendMax, setIsSendMax] = useState(false);
+  const [pendingBolt11, setPendingBolt11] = useState<string | null>(null);
+  const [feeEstimateSats, setFeeEstimateSats] = useState<number | null>(null);
   const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
@@ -446,6 +455,71 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [walletData?.balanceSats]);
 
+  const doInitWallet = async (
+    mnemonicOrSeed: string | undefined,
+    key: CryptoKey,
+    recovered: boolean,
+  ) => {
+    try {
+      await disposeWallet(walletRef.current);
+      walletRef.current = null;
+      cryptoKeyRef.current = key;
+      // Decrypt cached transfers in parallel with wallet init
+      const cachedTransfersPromise = (async () => {
+        try {
+          const cachedRaw = await getStoredItem(TRANSFERS_CACHE_KEY);
+          if (cachedRaw) {
+            const { iv: cIv, ct: cCt } = JSON.parse(cachedRaw);
+            const plain = await decryptText(key, cIv, cCt);
+            const parsed = JSON.parse(plain) as WalletTransfer[];
+            if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+          }
+        } catch { /* ignore cache decryption errors */ }
+        return null;
+      })();
+      const result = await SparkWallet.initialize({
+        ...(mnemonicOrSeed ? { mnemonicOrSeed } : {}),
+        options: { network: 'MAINNET' },
+      });
+      const wallet = result.wallet;
+      const mnemonic: string = (result as unknown as { mnemonic?: string }).mnemonic ?? mnemonicOrSeed ?? '';
+      const balance = await wallet.getBalance();
+      const encrypted = await encryptText(key, mnemonic);
+      await setStoredItem(WALLET_KEY, JSON.stringify(encrypted));
+      const cachedTransfers = await cachedTransfersPromise;
+      if (cachedTransfers) setRecentTransfers(cachedTransfers);
+      setWalletData({ wallet, mnemonic, balanceSats: balance.balance, recovered });
+      setActivePanel(null);
+      setInvoice(null);
+      if (!skipBackupRef.current) {
+        setBackupDownloaded(false);
+        setAppState('backup-prompt');
+      } else {
+        setAppState('ready');
+      }
+      subscribeToWalletEvents(wallet);
+      void loadTransfers(wallet);
+    } catch (err) {
+      setWalletError(err instanceof Error ? err.message : String(err));
+      setAppState('error');
+    }
+  };
+
+  const afterUnlock = useCallback(async (key: CryptoKey) => {
+    const walletRaw = await getStoredItem(WALLET_KEY);
+    if (!walletRaw) { setAppState('idle'); return; }
+    skipBackupRef.current = true;
+    setAppState('recovering');
+    try {
+      const { iv, ct } = JSON.parse(walletRaw);
+      const mnemonic = await decryptText(key, iv, ct);
+      await doInitWallet(mnemonic, key, true);
+    } catch {
+      setAppState('idle');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -480,7 +554,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [afterUnlock]);
 
   useEffect(() => () => {
     const wallet = walletRef.current;
@@ -488,7 +562,7 @@ export default function App() {
     void disposeWallet(wallet);
   }, [disposeWallet]);
 
-  const refreshBtcUsdRate = useCallback(async () => {
+  const refreshBtcUsdRate= useCallback(async () => {
     try {
       const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
       if (!response.ok) return;
@@ -568,71 +642,6 @@ export default function App() {
     wallet.on('deposit:confirmed', (_depositId: string, updatedBalance: bigint) => {
       setWalletData((prev) => prev ? { ...prev, balanceSats: updatedBalance } : prev);
     });
-  }, [disposeWallet]);
-
-  const doInitWallet = async (
-    mnemonicOrSeed: string | undefined,
-    key: CryptoKey,
-    recovered: boolean,
-  ) => {
-    try {
-      await disposeWallet(walletRef.current);
-      walletRef.current = null;
-      cryptoKeyRef.current = key;
-      // Decrypt cached transfers in parallel with wallet init
-      const cachedTransfersPromise = (async () => {
-        try {
-          const cachedRaw = await getStoredItem(TRANSFERS_CACHE_KEY);
-          if (cachedRaw) {
-            const { iv: cIv, ct: cCt } = JSON.parse(cachedRaw);
-            const plain = await decryptText(key, cIv, cCt);
-            const parsed = JSON.parse(plain) as WalletTransfer[];
-            if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-          }
-        } catch { /* ignore cache decryption errors */ }
-        return null;
-      })();
-      const result = await SparkWallet.initialize({
-        ...(mnemonicOrSeed ? { mnemonicOrSeed } : {}),
-        options: { network: 'MAINNET' },
-      });
-      const wallet = result.wallet;
-      const mnemonic: string = (result as unknown as { mnemonic?: string }).mnemonic ?? mnemonicOrSeed ?? '';
-      const balance = await wallet.getBalance();
-      const encrypted = await encryptText(key, mnemonic);
-      await setStoredItem(WALLET_KEY, JSON.stringify(encrypted));
-      const cachedTransfers = await cachedTransfersPromise;
-      if (cachedTransfers) setRecentTransfers(cachedTransfers);
-      setWalletData({ wallet, mnemonic, balanceSats: balance.balance, recovered });
-      setActivePanel(null);
-      setInvoice(null);
-      if (!skipBackupRef.current) {
-        setBackupDownloaded(false);
-        setAppState('backup-prompt');
-      } else {
-        setAppState('ready');
-      }
-      subscribeToWalletEvents(wallet);
-      void loadTransfers(wallet);
-    } catch (err) {
-      setWalletError(err instanceof Error ? err.message : String(err));
-      setAppState('error');
-    }
-  };
-
-  const afterUnlock = useCallback(async (key: CryptoKey) => {
-    const walletRaw = await getStoredItem(WALLET_KEY);
-    if (!walletRaw) { setAppState('idle'); return; }
-    skipBackupRef.current = true;
-    setAppState('recovering');
-    try {
-      const { iv, ct } = JSON.parse(walletRaw);
-      const mnemonic = await decryptText(key, iv, ct);
-      await doInitWallet(mnemonic, key, true);
-    } catch {
-      setAppState('idle');
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handlePinSetupNext = (pin = pinInput) => {
@@ -736,6 +745,9 @@ export default function App() {
     setLnurlPayInfo(null);
     setSendError(null);
     setSendTxId(null);
+    setPendingBolt11(null);
+    setFeeEstimateSats(null);
+    setIsSendMax(false);
   };
 
   const handleDeleteWalletAndReset = async () => {
@@ -772,26 +784,108 @@ export default function App() {
     }
   };
 
-  const handleResolveLnurl = async () => {
-    if (!sendInput.trim() || !walletData) return;
-    setResolving(true);
-    setSendError(null);
-    try {
-      const info = await resolveLnurlPayInfo(sendInput.trim());
-      const minSendableSats = Math.ceil(info.minSendableMsats / 1000);
-      const lnurlMaxSats = Math.floor(info.maxSendableMsats / 1000);
-      const maxSpendableSats = getMaxSpendableSats(Number(walletData.balanceSats));
-      const effectiveMaxSats = Math.min(lnurlMaxSats, maxSpendableSats);
+  const handleSendPayment = async () => {
+    if (!walletData) return;
 
-      if (effectiveMaxSats < minSendableSats) {
+    // If lnurlPayInfo not yet resolved, resolve first then validate amount.
+    let payInfo = lnurlPayInfo;
+    if (!payInfo) {
+      if (!sendInput.trim()) return;
+      setResolving(true);
+      setSendError(null);
+      try {
+        const info = await resolveLnurlPayInfo(sendInput.trim());
+        const minSendableSats = Math.ceil(info.minSendableMsats / 1000);
+        const lnurlMaxSats = Math.floor(info.maxSendableMsats / 1000);
+        const maxSpendableSats = getMaxSpendableSats(Number(walletData.balanceSats));
+        const effectiveMaxSats = Math.min(lnurlMaxSats, maxSpendableSats);
+        if (effectiveMaxSats < minSendableSats) {
+          setSendError('Balance is too low to cover this payment plus network fees.');
+          return;
+        }
+        setLnurlPayInfo(info);
+        setResolvedInput(sendInput.trim());
+        payInfo = info;
+      } catch (err) {
+        setSendError(err instanceof Error ? err.message : String(err));
+        return;
+      } finally {
+        setResolving(false);
+      }
+      // If no amount entered yet, stop here so the user can enter one.
+      if (!sendAmountSats.trim()) return;
+    }
+    const balanceSats = Number(walletData.balanceSats);
+    let effectiveAmountSats: number;
+
+    if (isSendMax) {
+      // Deduct fee from balance so total never exceeds balance.
+      const lnurlCap = payInfo ? Math.floor(payInfo.maxSendableMsats / 1000) : Infinity;
+      effectiveAmountSats = Math.min(getMaxSpendableSats(balanceSats), lnurlCap);
+      if (payInfo && effectiveAmountSats < Math.ceil(payInfo.minSendableMsats / 1000)) {
         setSendError('Balance is too low to cover this payment plus network fees.');
         return;
       }
+    } else {
+      const parsed = parseInt(sendAmountSats, 10);
+      if (isNaN(parsed) || parsed <= 0) { setSendError('Enter a valid amount.'); return; }
+      if (parsed > balanceSats) {
+        setSendError('Amount exceeds your balance.');
+        return;
+      }
+      if (payInfo) {
+        const amountMsats = parsed * 1000;
+        if (amountMsats < payInfo.minSendableMsats) {
+          setSendError(`Minimum is ${Math.ceil(payInfo.minSendableMsats / 1000)} sats.`);
+          return;
+        }
+        if (amountMsats > payInfo.maxSendableMsats) {
+          setSendError(`Maximum is ${Math.floor(payInfo.maxSendableMsats / 1000)} sats.`);
+          return;
+        }
+      }
+      effectiveAmountSats = parsed;
+    }
 
-      setLnurlPayInfo(info);
-      setResolvedInput(sendInput.trim());
-      setSendAmountSats('');
-      setSendStep('amount');
+    setSendError(null);
+    setResolving(true);
+    try {
+      if (!payInfo) { setSendError('Could not resolve payment destination.'); return; }
+      let bolt11 = await fetchInvoiceFromCallback(payInfo.callback, effectiveAmountSats * 1000);
+      let fee: number | null = null;
+      try {
+        fee = await (walletData.wallet as unknown as {
+          getLightningSendFeeEstimate: (p: { encodedInvoice: string }) => Promise<number>;
+        }).getLightningSendFeeEstimate({ encodedInvoice: bolt11 });
+      } catch {
+        fee = getMaxFeeSats(effectiveAmountSats);
+      }
+      const safeFee = fee ?? getMaxFeeSats(effectiveAmountSats);
+      // If amount + fee would exceed balance, deduct the fee from the send amount and re-fetch.
+      if (effectiveAmountSats + safeFee > balanceSats) {
+        effectiveAmountSats = balanceSats - safeFee;
+        if (effectiveAmountSats <= 0) {
+          setSendError('Balance is too low to cover the network fee.');
+          return;
+        }
+        if (payInfo && effectiveAmountSats * 1000 < payInfo.minSendableMsats) {
+          setSendError(`Balance is too low. After fees, you can only send ${effectiveAmountSats} sats but minimum is ${Math.ceil(payInfo.minSendableMsats / 1000)} sats.`);
+          return;
+        }
+        bolt11 = await fetchInvoiceFromCallback(payInfo.callback, effectiveAmountSats * 1000);
+        // Re-estimate fee for the adjusted amount; reuse safeFee if SDK call fails.
+        try {
+          fee = await (walletData.wallet as unknown as {
+            getLightningSendFeeEstimate: (p: { encodedInvoice: string }) => Promise<number>;
+          }).getLightningSendFeeEstimate({ encodedInvoice: bolt11 });
+        } catch {
+          fee = safeFee;
+        }
+      }
+      setSendAmountSats(String(effectiveAmountSats));
+      setPendingBolt11(bolt11);
+      setFeeEstimateSats(fee);
+      setSendStep('confirm');
     } catch (err) {
       setSendError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -799,31 +893,13 @@ export default function App() {
     }
   };
 
-  const handleSendPayment = async () => {
-    if (!walletData || !lnurlPayInfo) return;
-    const amountSats = parseInt(sendAmountSats, 10);
-    if (isNaN(amountSats) || amountSats <= 0) { setSendError('Enter a valid amount.'); return; }
-    const maxSpendableSats = getMaxSpendableSats(Number(walletData.balanceSats));
-    if (amountSats > maxSpendableSats) {
-      setSendError(`Maximum spendable amount is ${maxSpendableSats} sats after fees.`);
-      return;
-    }
-    const amountMsats = amountSats * 1000;
-    if (amountMsats < lnurlPayInfo.minSendableMsats) {
-      setSendError(`Minimum is ${Math.ceil(lnurlPayInfo.minSendableMsats / 1000)} sats.`);
-      return;
-    }
-    if (amountMsats > lnurlPayInfo.maxSendableMsats) {
-      setSendError(`Maximum is ${Math.floor(lnurlPayInfo.maxSendableMsats / 1000)} sats.`);
-      return;
-    }
-    setSendError(null);
+  const handleConfirmPayment = async () => {
+    if (!walletData || !pendingBolt11) return;
     setSendStep('sending');
     try {
-      const bolt11 = await fetchInvoiceFromCallback(lnurlPayInfo.callback, amountMsats);
       const result = await walletData.wallet.payLightningInvoice({
-        invoice: bolt11,
-        maxFeeSats: getMaxFeeSats(amountSats),
+        invoice: pendingBolt11,
+        maxFeeSats: feeEstimateSats !== null ? Math.max(feeEstimateSats, getMaxFeeSats(parseInt(sendAmountSats, 10))) : getMaxFeeSats(parseInt(sendAmountSats, 10)),
       });
       const txId =
         'id' in result ? (result as { id: string }).id
@@ -840,17 +916,7 @@ export default function App() {
   };
 
   const isLoading = appState === 'creating' || appState === 'recovering';
-  const minSats = lnurlPayInfo ? Math.ceil(lnurlPayInfo.minSendableMsats / 1000) : 1;
-  const walletMaxSendSats = walletData ? getMaxSpendableSats(Number(walletData.balanceSats)) : undefined;
-  const lnurlMaxSats = lnurlPayInfo ? Math.floor(lnurlPayInfo.maxSendableMsats / 1000) : undefined;
-  const maxSats = lnurlMaxSats === undefined
-    ? walletMaxSendSats
-    : walletMaxSendSats === undefined
-      ? lnurlMaxSats
-      : Math.min(lnurlMaxSats, walletMaxSendSats);
-  const amountNum = parseInt(sendAmountSats, 10);
-  const amountValid = !isNaN(amountNum) && amountNum >= minSats && (maxSats === undefined || amountNum <= maxSats);
-  const usdBalance = walletData && btcUsdRate !== null
+  const usdBalance= walletData && btcUsdRate !== null
     ? (Number(walletData.balanceSats) / 100000000) * btcUsdRate
     : null;
   const satsDisplay = walletData ? walletData.balanceSats.toLocaleString('en-US') : '--';
@@ -859,7 +925,7 @@ export default function App() {
     : usdBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   return (
-    <div className="w-[324px] max-h-[600px] overflow-y-auto bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
+    <div className="w-81 max-h-150 overflow-y-auto bg-white text-neutral-900 flex flex-col p-4 dark:bg-neutral-950 dark:text-neutral-100">
 
       {appState === 'initializing' && (
         <div className="flex flex-col items-center gap-4 py-8">
@@ -1099,7 +1165,7 @@ export default function App() {
                   <FaGear className="w-4 h-4" />
                 </button>
                 {showSettingsMenu && (
-                  <div className="absolute right-0 top-9 z-10 min-w-[120px] p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
+                  <div className="absolute right-0 top-9 z-10 min-w-30 p-2 rounded-lg bg-white border border-neutral-200 shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
                     <div className="flex flex-col items-start gap-1">
                       <button
                         onClick={() => {
@@ -1239,75 +1305,91 @@ export default function App() {
           </>
 
           {activePanel === 'send' && (
-            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-neutral-800">
+            <div className="space-y-3">
               {/* <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200">Send via Lightning Address / LNURL</p> */}
 
-              {sendStep === 'input' && (
+              {(sendStep === 'input' || sendStep === 'amount') && (
                 <div className="space-y-2">
-                  <input
-                    type="text"
-                    value={sendInput}
-                    onChange={(e) => setSendInput(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
-                    placeholder="e.g. austinvach@cash.app"
-                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
-                  />
+                  <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-2">
+                    <label className="text-xs text-neutral-400 whitespace-nowrap">Recipient</label>
+                    <input
+                      type="text"
+                      value={sendInput}
+                      onChange={(e) => {
+                        setSendInput(e.target.value);
+                        if (e.target.value.trim() !== resolvedInput) {
+                          setLnurlPayInfo(null);
+                          setSendAmountSats('');
+                          setSendError(null);
+                          setIsSendMax(false);
+                        }
+                      }}
+                      onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleSendPayment()}
+                      placeholder="austinvach@cash.app"
+                      className="min-w-0 px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
+                    />
+                    <label className="text-xs text-neutral-400 whitespace-nowrap">Amount</label>
+                    <div className="flex gap-2 min-w-0">
+                      <input
+                        type="number"
+                        min="1"
+                        value={sendAmountSats}
+                        onChange={(e) => { setSendAmountSats(e.target.value); setIsSendMax(false); }}
+                        className="flex-1 min-w-0 px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
+                      />
+                      {walletData && Number(walletData.balanceSats) > 0 && (
+                        <button
+                          onClick={() => { setSendAmountSats(String(walletData.balanceSats)); setIsSendMax(true); }}
+                          className="px-3 py-2 text-xs font-semibold rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200 whitespace-nowrap"
+                        >
+                          Send Max
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
                   <button
-                    onClick={handleResolveLnurl}
+                    onClick={handleSendPayment}
                     disabled={!sendInput.trim() || resolving}
-                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors flex items-center justify-center gap-2 dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100 flex items-center justify-center gap-2"
                   >
-                    {resolving ? (<><Spinner className="w-3.5 h-3.5" /> Resolving...</>) : 'Continue'}
+                    {resolving ? <><Spinner className="w-3 h-3" /> {lnurlPayInfo ? 'Getting fee…' : 'Resolving…'}</> : 'Review & Pay'}
                   </button>
                 </div>
               )}
 
-              {sendStep === 'amount' && lnurlPayInfo && (
-                <div className="space-y-2">
-                  <input
-                    type="text"
-                    value={sendInput}
-                    onChange={(e) => {
-                      setSendInput(e.target.value);
-                      if (e.target.value.trim() !== resolvedInput) {
-                        setLnurlPayInfo(null);
-                        setSendAmountSats('');
-                        setSendError(null);
-                        setSendStep('input');
-                      }
-                    }}
-                    onKeyDown={(e) => e.key === 'Enter' && sendInput.trim() && handleResolveLnurl()}
-                    placeholder="austinvach@cash.app"
-                    className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 placeholder-neutral-400 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:placeholder-neutral-600 dark:focus:border-neutral-400/50"
-                  />
-                  <div>
-                    <label className="block text-xs text-neutral-400 mb-1">
-                      Amount (₿){maxSats !== undefined ? <span className="text-neutral-600"> max {maxSats}</span> : ''}
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      value={sendAmountSats}
-                      onChange={(e) => setSendAmountSats(e.target.value)}
-                      className="w-full px-3 py-2 rounded-lg bg-white border border-neutral-300 text-xs text-neutral-800 focus:outline-none focus:border-neutral-500/50 dark:bg-neutral-800 dark:border-neutral-700 dark:text-neutral-200 dark:focus:border-neutral-400/50"
-                    />
+              {sendStep === 'confirm' && (
+                <div className="space-y-3">
+                  <div className="p-3 rounded-lg bg-neutral-100 border border-neutral-200 space-y-2 dark:bg-neutral-800/50 dark:border-neutral-700">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-neutral-500 dark:text-neutral-400">Amount</span>
+                      <span className="font-medium text-neutral-800 dark:text-neutral-200">{sendAmountSats} sats</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-neutral-500 dark:text-neutral-400">Network fee</span>
+                      <span className="font-medium text-neutral-800 dark:text-neutral-200">{feeEstimateSats !== null ? `≤ ${feeEstimateSats} sats` : '—'}</span>
+                    </div>
+                    <div className="border-t border-neutral-300 dark:border-neutral-600 pt-2 flex justify-between text-xs font-semibold">
+                      <span className="text-neutral-600 dark:text-neutral-300">Total deducted</span>
+                      <span className="text-neutral-900 dark:text-neutral-100">
+                        {feeEstimateSats !== null
+                          ? `≤ ${parseInt(sendAmountSats, 10) + feeEstimateSats} sats`
+                          : `${sendAmountSats} sats`}
+                      </span>
+                    </div>
                   </div>
                   {sendError && <p className="text-xs text-neutral-500 dark:text-neutral-400">{sendError}</p>}
-                  {maxSats !== undefined && maxSats > 0 && (
-                    <button
-                      onClick={() => setSendAmountSats(String(maxSats))}
-                      className="w-full py-2 text-xs font-semibold rounded-lg border border-neutral-300 text-neutral-500 hover:border-neutral-400 hover:text-neutral-800 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-neutral-600 dark:hover:text-neutral-200"
-                    >
-                      Send Max
-                    </button>
-                  )}
                   <button
-                    onClick={handleSendPayment}
-                    disabled={!amountValid}
-                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 disabled:opacity-40 disabled:pointer-events-none transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
+                    onClick={handleConfirmPayment}
+                    className="w-full py-2 text-xs font-semibold rounded-lg bg-neutral-900 text-white hover:bg-neutral-700 transition-colors dark:bg-neutral-200 dark:text-neutral-950 dark:hover:bg-neutral-100"
                   >
-                    Pay
+                    Confirm & Pay
+                  </button>
+                  <button
+                    onClick={() => { setSendStep('input'); setSendError(null); }}
+                    className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600"
+                  >
+                    Back
                   </button>
                 </div>
               )}
@@ -1341,7 +1423,7 @@ export default function App() {
               {sendStep === 'error' && (
                 <div className="space-y-2">
                   <div className="p-3 rounded-lg bg-neutral-100 border border-neutral-300 text-neutral-600 text-xs dark:bg-neutral-800/50 dark:border-neutral-600/30 dark:text-neutral-400">{sendError}</div>
-                  <button onClick={() => { setSendStep('amount'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600">
+                  <button onClick={() => { setSendStep('input'); setSendError(null); }} className="w-full py-2 text-xs font-medium rounded-lg border border-neutral-300 text-neutral-500 hover:text-neutral-800 hover:border-neutral-400 transition-colors dark:border-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200 dark:hover:border-neutral-600">
                     Try Again
                   </button>
                 </div>
@@ -1350,7 +1432,7 @@ export default function App() {
           )}
 
           {activePanel === 'receive' && (
-            <div className="p-4 rounded-xl bg-neutral-100 border border-neutral-200 space-y-3 dark:bg-neutral-900 dark:border-neutral-800">
+            <div className="space-y-3">
               {fetchingInvoice ? (
                 <div className="flex items-center justify-center py-8 gap-2 text-neutral-500">
                   <Spinner className="w-4 h-4 text-neutral-400" />
