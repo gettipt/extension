@@ -5,6 +5,9 @@ interface OffscreenPayRequest {
   type: 'TIPT_OFFSCREEN_PAY_INVOICE';
   payload?: {
     invoice?: string;
+    sessionPin?: string;
+    pinRaw?: string;
+    walletRaw?: string;
   };
 }
 
@@ -20,19 +23,23 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
     return;
   }
 
-  const invoice = request.payload?.invoice;
+  const { invoice, sessionPin, pinRaw, walletRaw } = request.payload ?? {};
   if (!invoice || typeof invoice !== 'string') {
     sendResponse({ ok: false, error: 'Missing invoice for offscreen payment.' } satisfies OffscreenPayResponse);
+    return;
+  }
+  if (!sessionPin || !pinRaw || !walletRaw) {
+    sendResponse({ ok: false, error: 'Missing wallet credentials for offscreen payment.' } satisfies OffscreenPayResponse);
     return;
   }
 
   (async () => {
     try {
-      const payment = await payInvoiceFromSession(invoice);
+      const payment = await payInvoiceFromSession(invoice, sessionPin, pinRaw, walletRaw);
       sendResponse({ ok: true, preimage: payment.preimage } satisfies OffscreenPayResponse);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to pay invoice.';
-      sendResponse({ ok: false, error: message } satisfies OffscreenPayResponse);
+      const msg = error instanceof Error ? error.message : 'Failed to pay invoice.';
+      sendResponse({ ok: false, error: msg } satisfies OffscreenPayResponse);
     }
   })();
 

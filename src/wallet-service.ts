@@ -1,9 +1,6 @@
 import { SparkWallet } from '@buildonspark/spark-sdk'
 import { decryptText, deriveKey, hexToBuf } from './crypto'
 
-const PIN_KEY = 'spark_pin';
-const WALLET_KEY = 'spark_wallet';
-const SESSION_PIN_KEY = 'spark_session_pin';
 const SENTINEL = 'spark_wallet_v1';
 
 interface PinPayload {
@@ -30,18 +27,6 @@ function getResultString(result: unknown, keys: string[]): string | null {
   }
 
   return null;
-}
-
-async function getSyncString(key: string): Promise<string | null> {
-  const items = await chrome.storage.sync.get([key]);
-  const value = items[key];
-  return typeof value === 'string' ? value : null;
-}
-
-async function getSessionString(key: string): Promise<string | null> {
-  const items = await chrome.storage.session.get([key]);
-  const value = items[key];
-  return typeof value === 'string' ? value : null;
 }
 
 async function disposeWallet(wallet: SparkWallet | null) {
@@ -72,22 +57,7 @@ async function disposeWallet(wallet: SparkWallet | null) {
   }
 }
 
-async function decryptMnemonicFromStorage(): Promise<string> {
-  const sessionPin = await getSessionString(SESSION_PIN_KEY);
-  if (!sessionPin) {
-    throw new Error('Wallet is locked. Open TIPT and unlock first.');
-  }
-
-  const pinRaw = await getSyncString(PIN_KEY);
-  if (!pinRaw) {
-    throw new Error('PIN verifier not found.');
-  }
-
-  const walletRaw = await getSyncString(WALLET_KEY);
-  if (!walletRaw) {
-    throw new Error('Encrypted wallet not found.');
-  }
-
+async function decryptMnemonicFromCredentials(sessionPin: string, pinRaw: string, walletRaw: string): Promise<string> {
   const pinPayload = JSON.parse(pinRaw) as PinPayload;
   const walletPayload = JSON.parse(walletRaw) as WalletPayload;
   const key = await deriveKey(sessionPin, hexToBuf(pinPayload.salt));
@@ -95,7 +65,6 @@ async function decryptMnemonicFromStorage(): Promise<string> {
   if (verifier !== SENTINEL) {
     throw new Error('Session PIN is invalid. Unlock TIPT again.');
   }
-
   return decryptText(key, walletPayload.iv, walletPayload.ct);
 }
 
@@ -124,24 +93,7 @@ function touchWalletIdleTimer() {
   }, WALLET_IDLE_TIMEOUT_MS);
 }
 
-async function assertUnlockedSession(): Promise<void> {
-  const sessionPin = await getSessionString(SESSION_PIN_KEY);
-  if (!sessionPin) {
-    const walletToDispose = cachedWallet;
-    cachedWallet = null;
-    walletInitPromise = null;
-    if (walletIdleTimer !== undefined) {
-      clearTimeout(walletIdleTimer);
-      walletIdleTimer = undefined;
-    }
-    await disposeWallet(walletToDispose);
-    throw new Error('Wallet is locked. Open TIPT and unlock first.');
-  }
-}
-
-async function getOrCreateWallet(): Promise<SparkWallet> {
-  await assertUnlockedSession();
-
+async function getOrCreateWallet(sessionPin: string, pinRaw: string, walletRaw: string): Promise<SparkWallet> {
   if (cachedWallet) {
     touchWalletIdleTimer();
     return cachedWallet;
@@ -149,7 +101,7 @@ async function getOrCreateWallet(): Promise<SparkWallet> {
 
   if (!walletInitPromise) {
     walletInitPromise = (async () => {
-      const mnemonic = await decryptMnemonicFromStorage();
+      const mnemonic = await decryptMnemonicFromCredentials(sessionPin, pinRaw, walletRaw);
       const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic, options: { network: 'MAINNET' } });
       cachedWallet = initialized.wallet;
       touchWalletIdleTimer();
@@ -202,8 +154,13 @@ function getRecommendedMaxFeeSats(amountSats: number): number {
   return Math.max(5, Math.ceil(amountSats * 0.0017));
 }
 
-export async function payInvoiceFromSession(invoice: string): Promise<{ preimage: string }> {
-  const wallet = await getOrCreateWallet();
+export async function payInvoiceFromSession(
+  invoice: string,
+  sessionPin: string,
+  pinRaw: string,
+  walletRaw: string,
+): Promise<{ preimage: string }> {
+  const wallet = await getOrCreateWallet(sessionPin, pinRaw, walletRaw);
 
   let maxFeeSats = 50; // conservative fallback
   try {

@@ -277,12 +277,17 @@ async function ensureOffscreenDocument(): Promise<void> {
   await offscreenInitPromise;
 }
 
-function requestPreimageFromOffscreen(invoice: string): Promise<string> {
+function requestPreimageFromOffscreen(
+  invoice: string,
+  sessionPin: string,
+  pinRaw: string,
+  walletRaw: string,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'TIPT_OFFSCREEN_PAY_INVOICE',
-        payload: { invoice },
+        payload: { invoice, sessionPin, pinRaw, walletRaw },
       },
       (response: OffscreenPayResponse) => {
         if (chrome.runtime.lastError) {
@@ -347,8 +352,22 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
 
   try {
     console.log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
+
+    // Read credentials in background (offscreen docs lack chrome.storage access).
+    const sessionItems = await chrome.storage.session.get(['spark_session_pin']);
+    const sessionPin = typeof sessionItems['spark_session_pin'] === 'string' ? sessionItems['spark_session_pin'] : null;
+    if (!sessionPin) {
+      return { approved: false, error: 'Wallet is locked. Open TIPT and unlock first.' };
+    }
+    const syncItems = await chrome.storage.sync.get(['spark_pin', 'spark_wallet']);
+    const pinRaw = typeof syncItems['spark_pin'] === 'string' ? syncItems['spark_pin'] : null;
+    const walletRaw = typeof syncItems['spark_wallet'] === 'string' ? syncItems['spark_wallet'] : null;
+    if (!pinRaw || !walletRaw) {
+      return { approved: false, error: 'Wallet data not found.' };
+    }
+
     await ensureOffscreenDocument();
-    const preimage = await requestPreimageFromOffscreen(invoice);
+    const preimage = await requestPreimageFromOffscreen(invoice, sessionPin, pinRaw, walletRaw);
     console.log('[TIPT-BG] Payment successful, preimage:', preimage, '(len:', preimage.length, ')');
 
     const authorization = buildAuthorizationValue(payload.challenge, preimage);

@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TIPT MPP Demo</title>
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("clawpilotTheme");
+      const theme = param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+      --cp-bg: #f7f4ef;
+      --cp-bg-elevated: #fcfbf8;
+      --cp-surface: #ffffff;
+      --cp-surface-soft: #f5f5f5;
+      --cp-border: #dedede;
+      --cp-border-strong: #919191;
+      --cp-text: #242424;
+      --cp-text-muted: #5c5c5c;
+      --cp-text-soft: #6f6f6f;
+      --cp-accent: #b11f4b;
+      --cp-accent-hover: #9a1a41;
+      --cp-accent-soft: rgba(177, 31, 75, 0.08);
+      --cp-accent-fg: #ffffff;
+      --cp-success: #16a34a;
+      --cp-danger: #dc2626;
+      --cp-warning: #f59e0b;
+      --cp-link: #0078d4;
+      --cp-shadow: 0 18px 48px rgba(0,0,0,0.12);
+    }
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --cp-bg: #3d3b3a;
+      --cp-bg-elevated: #343231;
+      --cp-surface: #292929;
+      --cp-surface-soft: #2e2e2e;
+      --cp-border: #474747;
+      --cp-border-strong: #5f5f5f;
+      --cp-text: #dedede;
+      --cp-text-muted: #919191;
+      --cp-text-soft: #b0b0b0;
+      --cp-accent: #fd8ea1;
+      --cp-accent-hover: #fb7b91;
+      --cp-accent-soft: rgba(253, 142, 161, 0.14);
+      --cp-accent-fg: #1a1a1a;
+      --cp-success: #4ade80;
+      --cp-danger: #f87171;
+      --cp-warning: #fbbf24;
+      --cp-link: #4da6ff;
+      --cp-shadow: 0 18px 48px rgba(0,0,0,0.32);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--cp-bg);
+      color: var(--cp-text);
+      font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 32px 16px;
+      gap: 20px;
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .card {
+      background: var(--cp-surface);
+      border: 1px solid var(--cp-border);
+      border-radius: 16px;
+      padding: 20px;
+      width: 100%;
+      max-width: 520px;
+      box-shadow: 0 0 2px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.14);
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--cp-text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 14px;
+    }
+
+    .wallet-status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: var(--cp-surface-soft);
+      border: 1px solid var(--cp-border);
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--cp-border-strong);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .status-dot.detected { background: var(--cp-success); }
+    .status-dot.waiting { background: var(--cp-warning); animation: pulse 1s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .status-text { font-size: 13px; color: var(--cp-text-soft); }
+    .status-caps { font-size: 11px; color: var(--cp-text-muted); margin-top: 2px; font-family: Consolas, "Courier New", monospace; }
+
+    .form-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 10px 12px;
+      margin-bottom: 14px;
+    }
+
+    label {
+      font-size: 13px;
+      color: var(--cp-text-muted);
+      white-space: nowrap;
+    }
+
+    input {
+      width: 100%;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--cp-border);
+      background: var(--cp-surface-soft);
+      color: var(--cp-text);
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: var(--cp-border-strong); }
+    input::placeholder { color: var(--cp-text-muted); }
+
+    button {
+      width: 100%;
+      padding: 9px 16px;
+      border-radius: 10px;
+      border: none;
+      background: var(--cp-accent);
+      color: var(--cp-accent-fg);
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    button:hover:not(:disabled) { background: var(--cp-accent-hover); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .response-box {
+      border-radius: 10px;
+      border: 1px solid var(--cp-border);
+      overflow: hidden;
+    }
+
+    .response-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: var(--cp-surface-soft);
+      border-bottom: 1px solid var(--cp-border);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--cp-text-muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .badge-success { background: var(--cp-accent-soft); color: var(--cp-success); }
+    .badge-error   { background: var(--cp-accent-soft); color: var(--cp-danger); }
+    .badge-waiting { background: var(--cp-accent-soft); color: var(--cp-warning); }
+
+    pre {
+      padding: 12px;
+      font-size: 12px;
+      font-family: Consolas, "Courier New", monospace;
+      color: var(--cp-text);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+      background: var(--cp-surface);
+      margin: 0;
+    }
+
+    .log {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 8px;
+      font-size: 12px;
+      font-family: Consolas, "Courier New", monospace;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: var(--cp-surface-soft);
+      border: 1px solid var(--cp-border);
+    }
+    .log-time { color: var(--cp-text-muted); flex-shrink: 0; }
+    .log-event { color: var(--cp-accent); font-weight: 600; flex-shrink: 0; }
+    .log-msg { color: var(--cp-text-soft); }
+
+    .empty { color: var(--cp-text-muted); font-size: 13px; font-style: italic; padding: 8px 0; }
+
+    .divider {
+      height: 1px;
+      background: var(--cp-border);
+      margin: 14px 0;
+    }
+
+    .error-msg {
+      font-size: 12px;
+      color: var(--cp-danger);
+      margin-top: 6px;
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>TIPT MPP Demo</h1>
+
+  <!-- Wallet Status -->
+  <div class="card">
+    <div class="card-title">Wallet Status</div>
+    <div class="wallet-status">
+      <div class="status-dot waiting" id="statusDot"></div>
+      <div>
+        <div class="status-text" id="statusText">Waiting for TIPT…</div>
+        <div class="status-caps" id="statusCaps"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Payment Form -->
+  <div class="card">
+    <div class="card-title">Request Payment</div>
+    <div class="form-grid">
+      <label for="lnurl">Recipient</label>
+      <input id="lnurl" type="text" placeholder="user@domain.com or lnurl1…" />
+      <label for="amount">&#8383;</label>
+      <input id="amount" type="number" min="1" placeholder="Amount in sats" />
+    </div>
+    <div class="error-msg" id="formError"></div>
+    <button id="payBtn" disabled>Pay via TIPT</button>
+  </div>
+
+  <!-- Response -->
+  <div class="card">
+    <div class="card-title">Payment Response</div>
+    <div id="responseEmpty" class="empty">No payment sent yet.</div>
+    <div id="responseBox" class="response-box" style="display:none">
+      <div class="response-header">
+        <span>mpp:payresponse</span>
+        <span id="responseBadge" class="badge"></span>
+      </div>
+      <pre id="responseJson"></pre>
+    </div>
+  </div>
+
+  <!-- Event Log -->
+  <div class="card">
+    <div class="card-title">Event Log</div>
+    <div class="log" id="eventLog">
+      <div class="empty" id="logEmpty">No events yet.</div>
+    </div>
+  </div>
+
+  <script>
+    // ── Bech32 decoder (for lnurl1… strings) ──────────────────────────────────
+    const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+    const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+    function polymod(values) {
+      let chk = 1;
+      for (const v of values) {
+        const b = chk >> 25;
+        chk = (chk & 0x1ffffff) << 5 ^ v;
+        for (let i = 0; i < 5; i++) if ((b >> i) & 1) chk ^= GENERATOR[i];
+      }
+      return chk;
+    }
+    function hrpExpand(hrp) {
+      const r = [];
+      for (let i = 0; i < hrp.length; i++) r.push(hrp.charCodeAt(i) >> 5);
+      r.push(0);
+      for (let i = 0; i < hrp.length; i++) r.push(hrp.charCodeAt(i) & 31);
+      return r;
+    }
+    function bech32Decode(str) {
+      str = str.toLowerCase();
+      const pos = str.lastIndexOf('1');
+      if (pos < 1 || pos + 7 > str.length || str.length > 2000) return null;
+      const hrp = str.slice(0, pos);
+      const data = [];
+      for (let i = pos + 1; i < str.length; i++) {
+        const d = CHARSET.indexOf(str[i]);
+        if (d === -1) return null;
+        data.push(d);
+      }
+      if (polymod([...hrpExpand(hrp), ...data]) !== 1) return null;
+      return data.slice(0, -6);
+    }
+    function fromWords(words) {
+      let value = 0, bits = 0;
+      const out = [];
+      for (const w of words) {
+        value = (value << 5) | w; bits += 5;
+        while (bits >= 8) { bits -= 8; out.push((value >> bits) & 0xff); }
+      }
+      return out;
+    }
+    function decodeLnurlStr(lnurl) {
+      const words = bech32Decode(lnurl);
+      if (!words) return null;
+      return new TextDecoder().decode(new Uint8Array(fromWords(words)));
+    }
+
+    // ── LNURL resolution ──────────────────────────────────────────────────────
+    async function resolveToUrl(input) {
+      input = input.trim();
+      if (input.includes('@')) {
+        const [user, domain] = input.split('@');
+        return `https://${domain}/.well-known/lnurlp/${user}`;
+      }
+      if (input.toLowerCase().startsWith('lnurl1')) {
+        const url = decodeLnurlStr(input);
+        if (!url) throw new Error('Failed to decode LNURL bech32 string.');
+        return url;
+      }
+      if (input.toLowerCase().startsWith('https://') || input.toLowerCase().startsWith('http://')) {
+        return input;
+      }
+      throw new Error('Unrecognised format. Use a Lightning Address, LNURL, or HTTPS URL.');
+    }
+
+    async function resolveLnurl(input) {
+      const url = await resolveToUrl(input);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`LNURL fetch failed: ${res.status}`);
+      const data = await res.json();
+      if (data.status === 'ERROR') throw new Error(data.reason || 'LNURL error');
+      if (data.tag !== 'payRequest') throw new Error('Not a payRequest LNURL endpoint.');
+      return data;
+    }
+
+    async function fetchInvoice(callback, amountMsats) {
+      const url = `${callback}${callback.includes('?') ? '&' : '?'}amount=${amountMsats}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Invoice fetch failed: ${res.status}`);
+      const data = await res.json();
+      if (data.status === 'ERROR') throw new Error(data.reason || 'Invoice error');
+      if (!data.pr) throw new Error('No invoice (pr) in response.');
+      return data.pr;
+    }
+
+    // ── UI helpers ─────────────────────────────────────────────────────────────
+    function now() {
+      return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function logEvent(event, msg) {
+      const el = document.getElementById('eventLog');
+      const empty = document.getElementById('logEmpty');
+      if (empty) empty.remove();
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.innerHTML = `<span class="log-time">${now()}</span><span class="log-event">${event}</span><span class="log-msg">${msg}</span>`;
+      el.prepend(entry);
+    }
+
+    function setFormError(msg) {
+      document.getElementById('formError').textContent = msg;
+    }
+
+    // ── Wallet status ─────────────────────────────────────────────────────────
+    window.addEventListener('mpp:announce', (e) => {
+      const detail = e.detail || {};
+      document.getElementById('statusDot').className = 'status-dot detected';
+      document.getElementById('statusText').textContent = `${detail.name || 'Wallet'} detected (v${detail.version || '?'})`;
+      document.getElementById('statusCaps').textContent = (detail.capabilities || []).join(', ');
+      document.getElementById('payBtn').disabled = false;
+      logEvent('mpp:announce', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}]`);
+    });
+
+    // Request announcement on load
+    logEvent('mpp:request', 'dispatched on page load');
+    window.dispatchEvent(new CustomEvent('mpp:request'));
+
+    // ── Pay button ─────────────────────────────────────────────────────────────
+    document.getElementById('payBtn').addEventListener('click', async () => {
+      setFormError('');
+      const lnurlInput = document.getElementById('lnurl').value.trim();
+      const amountSats = parseInt(document.getElementById('amount').value, 10);
+
+      if (!lnurlInput) { setFormError('Enter a Lightning Address or LNURL.'); return; }
+      if (!amountSats || amountSats <= 0) { setFormError('Enter a valid amount.'); return; }
+
+      const btn = document.getElementById('payBtn');
+      btn.disabled = true;
+      btn.textContent = 'Resolving…';
+
+      // Hide previous response
+      document.getElementById('responseEmpty').style.display = 'none';
+      document.getElementById('responseBox').style.display = 'none';
+
+      let invoice;
+      try {
+        logEvent('lnurl', `resolving ${lnurlInput}`);
+        const payInfo = await resolveLnurl(lnurlInput);
+        const minSats = Math.ceil(payInfo.minSendable / 1000);
+        const maxSats = Math.floor(payInfo.maxSendable / 1000);
+        if (amountSats < minSats) { throw new Error(`Minimum is ${minSats} sats.`); }
+        if (amountSats > maxSats) { throw new Error(`Maximum is ${maxSats} sats.`); }
+        logEvent('lnurl', `fetching invoice for ${amountSats} sats`);
+        invoice = await fetchInvoice(payInfo.callback, amountSats * 1000);
+        logEvent('lnurl', `invoice: ${invoice.slice(0, 24)}…`);
+      } catch (err) {
+        setFormError(err.message);
+        btn.disabled = false;
+        btn.textContent = 'Pay via TIPT';
+        return;
+      }
+
+      const requestId = crypto.randomUUID();
+      logEvent('mpp:pay', `requestId=${requestId.slice(0, 8)}…`);
+      btn.textContent = 'Waiting for TIPT…';
+
+      window.dispatchEvent(new CustomEvent('mpp:pay', {
+        detail: {
+          requestId,
+          invoice,
+          scheme: 'L402',
+        }
+      }));
+
+      // One-time response listener
+      function onResponse(e) {
+        const d = e.detail || {};
+        if (d.requestId !== requestId) return;
+        window.removeEventListener('mpp:payresponse', onResponse);
+
+        logEvent('mpp:payresponse', `approved=${d.approved}`);
+
+        const badge = document.getElementById('responseBadge');
+        if (d.approved) {
+          badge.className = 'badge badge-success';
+          badge.textContent = 'APPROVED';
+        } else {
+          badge.className = 'badge badge-error';
+          badge.textContent = 'REJECTED';
+        }
+
+        document.getElementById('responseJson').textContent = JSON.stringify(d, null, 2);
+        document.getElementById('responseBox').style.display = 'block';
+
+        btn.disabled = false;
+        btn.textContent = 'Pay via TIPT';
+      }
+
+      window.addEventListener('mpp:payresponse', onResponse);
+
+      // Timeout if no response in 90s
+      setTimeout(() => {
+        window.removeEventListener('mpp:payresponse', onResponse);
+        if (btn.textContent === 'Waiting for TIPT…') {
+          setFormError('No response from TIPT after 90 seconds.');
+          btn.disabled = false;
+          btn.textContent = 'Pay via TIPT';
+        }
+      }, 90_000);
+    });
+  </script>
+</body>
+</html>
