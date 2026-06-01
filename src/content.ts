@@ -43,10 +43,7 @@ function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
   });
 }
 
-// Announce wallet presence to the page.
-window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));
-
-// Re-announce and notify background (icon badge) when the page asks.
+// Announce presence and notify background (icon badge) when the page asks.
 window.addEventListener('mpp:request', () => {
   chrome.runtime.sendMessage({ type: MPP_REQUEST_TRIGGERED_EVENT });
   window.dispatchEvent(new CustomEvent('mpp:announce', { detail: announcement }));

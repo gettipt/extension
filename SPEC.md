@@ -93,18 +93,20 @@ Tapping **Confirm & Pay** on the review screen calls `payLightningInvoice`. On s
 TIPT does not inject scripts or intercept network traffic. Instead, websites explicitly request payment from TIPT using browser `CustomEvent`s. The content script (`content.ts`) runs at `document_start` on all URLs and acts as a bridge between the page and the background service worker.
 
 ### Wallet Advertisement
-On every page load, the content script immediately dispatches `mpp:announce`. When the page dispatches `mpp:request`, TIPT re-announces and also notifies the background to set the icon badge green for that tab.
+TIPT only announces itself when asked. When the page dispatches `mpp:request`, the content script responds with `mpp:announce` and also notifies the background to set the icon badge green for that tab.
 
 ```js
-// Fired by TIPT on page load
+// Site asks if a wallet is present
+window.dispatchEvent(new CustomEvent('mpp:request'));
+
+// TIPT responds
 window.addEventListener('mpp:announce', (e) => {
   console.log(e.detail);
   // { name: 'TIPT', version: '0.0.0', capabilities: ['l402', 'lightning-invoice'] }
 });
-
-// Site can request a fresh announcement
-window.dispatchEvent(new CustomEvent('mpp:request'));
 ```
+
+> **Note:** Always register the `mpp:announce` listener before dispatching `mpp:request`, since CustomEvents are synchronous.
 
 ### Payment Request
 The site dispatches `mpp:pay` with the invoice and challenge details. TIPT pays the invoice and dispatches `mpp:payresponse` with the resulting `Authorization` header value.
