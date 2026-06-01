@@ -14,7 +14,7 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 ### Restore Wallet Workflow
 - The user can restore a wallet by entering an existing BIP-39 mnemonic on the setup screen.
 - Mnemonics can be pasted as text or imported from a `.txt` file.
-- Once the mneumonic is provided (and validated locally), the user is asked to create and confirm a 5-digit numeric PIN.
+- Once the mnemonic is provided (and validated locally), the user is asked to create and confirm a 5-digit numeric PIN.
 - The encrypted mnemonic and PIN verifier are stored in `chrome.storage.sync` so they survive across browser profiles.
 
 ### Unlock
@@ -27,7 +27,7 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 - The wallet instance is cached in the offscreen document and torn down after **90 seconds of idle** to release resources.
 
 ### Balance
-- Balance is displayed in bitcoin (satoshis) or USD (togglable).
+- Balance is displayed in satoshis or USD (togglable via ⇅ button).
 - USD conversion rate is fetched from CoinGecko every **5 minutes**.
 - Balance updates are received via `transfer:claimed` and `deposit:confirmed` wallet events.
 - When the balance increases while the Receive panel is open, the panel closes automatically.
@@ -35,35 +35,49 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 ### Transfer History
 - The 10 most recent transfers are loaded after each balance update.
 - Transfers are encrypted and cached in `chrome.storage.sync` so they appear instantly on next unlock.
-- Up to 3 recent transfers are shown by default; a "Show all" toggle expands the list.
+- Up to 4 recent transfers are shown by default; a "Show all" toggle expands the list.
 
 ### Settings
-- **Reset wallet** — removes the stored mnemonic and PIN, returning to the setup screen.
+- **Reset wallet** — removes the stored mnemonic, PIN, and transfer cache, then reloads to the setup screen.
+
+---
 
 ## Send
 
-The Send panel accepts three input formats:
+The Send panel accepts Lightning Addresses and LNURLs. Both resolve via LNURL-pay to fetch a BOLT11 invoice.
 
-| Format | Example | Description |
-|---|---|---|
-| Lightning Address |`user@domain.com`| Resolved via LNURL-pay to fetch an invoice. |
-| LNURL |`lnurl1…`| Decoded to a URL, metadata fetched, then an invoice is fetched. |
-| Lightning Invoice |`lnbc…`| Decoded and paid directly.|
+### Send flow
 
-### LNURL / Lightning Address flow
-1. User enters the address or LNURL and taps **Next**.
-2. The extension fetches pay metadata (min/max sendable, description).
-3. User enters a sats amount within the allowed range.
-4. Invoice is fetched from the LNURL callback and paid.
+The send UI is a single screen with two labeled fields:
+- **Recipient** — Lightning Address (e.g. `user@domain.com`) or LNURL
+- **₿** — Amount in satoshis, with a **Send Max** button
+
+Tapping **Review & Pay**:
+1. If the LNURL has not yet been resolved, it is resolved now to fetch min/max sendable and the callback URL.
+2. If no amount has been entered after resolution, the flow stops so the user can enter one.
+3. The amount is validated against the LNURL min/max and the wallet balance.
+4. A BOLT11 invoice is fetched from the LNURL callback for the requested amount.
+5. `getLightningSendFeeEstimate` is called on the invoice to get the real network fee. Falls back to `max(5, ceil(amount × 0.17%))` if the SDK call fails.
+6. **Fee safety guard**: if `amount + fee > balance`, the send amount is automatically reduced to `balance − fee` and a new invoice is fetched for the adjusted amount.
+7. The **Review** screen is shown with: Amount / Network fee / Total deducted.
+
+Tapping **Confirm & Pay** on the review screen calls `payLightningInvoice`. On success, the success notification is shown and automatically dismissed after **5 seconds**, returning to the main screen.
+
+### Send Max
+- Clicking **Send Max** populates the amount field with the full wallet balance (raw `balanceSats`).
+- On **Review & Pay**, the effective send amount is computed as `getMaxSpendableSats(balance)` (fee-adjusted), capped by the LNURL maximum.
 
 ### Fee policy
-- Max fee follows Spark's recommendation: `max(5, ceil(amount × 0.17%))` sats.
-- The UI shows the max spendable amount accounting for fees.
-- For automated 402 payments, `getLightningSendFeeEstimate` is called first and the result is used as `maxFeeSats`, falling back to 50 sats if the estimate is unavailable.
+- Formula: `max(5, ceil(amount × 0.0017))` sats (17 bps, minimum 5 sats).
+- `getMaxSpendableSats` iterates down from `floor(balance × 10000/10017)` to find the largest amount where `amount + fee ≤ balance`.
+- For the send UI, `getLightningSendFeeEstimate` is always attempted first; the formula is the fallback.
+- For automated 402 payments (background), `getLightningSendFeeEstimate` is called first. The result is used directly if it is a finite number; otherwise the formula is applied to the invoice amount; 50 sats is the final fallback.
 
 ### Payment execution
-- `payLightningInvoice` is called via the Spark SDK.
-- Because the SDK returns immediately after initiating, the preimage is polled every **750 ms** for up to **60 seconds**.
+- `payLightningInvoice` is called via the Spark SDK with `maxFeeSats = max(feeEstimate, formulaFee)`.
+- Because the SDK returns immediately after initiating, the preimage is polled every **750 ms** for up to **60 seconds** via `getLightningSendRequest`.
+
+---
 
 ## Receive
 
@@ -71,18 +85,21 @@ The Send panel accepts three input formats:
 - The invoice is displayed as a QR code and as copyable text.
 - The panel closes automatically when an incoming payment is detected.
 
+---
+
 ## 402 Payment Protocol (MPP Events)
 
 ### Overview
-TIPT does not inject scripts or intercept network traffic. Instead, websites explicitly request payment from TIPT using browser `CustomEvent`s. The content script acts as a bridge between the page and the extension's background service worker.
+TIPT does not inject scripts or intercept network traffic. Instead, websites explicitly request payment from TIPT using browser `CustomEvent`s. The content script (`content.ts`) runs at `document_start` on all URLs and acts as a bridge between the page and the background service worker.
 
 ### Wallet Advertisement
-When a page loads, the content script immediately dispatches `mpp:announce` so the site knows TIPT is present. Sites can also trigger a fresh announcement at any time by dispatching `mpp:request`.
+On every page load, the content script immediately dispatches `mpp:announce`. When the page dispatches `mpp:request`, TIPT re-announces and also notifies the background to set the icon badge green for that tab.
 
 ```js
 // Fired by TIPT on page load
 window.addEventListener('mpp:announce', (e) => {
-  console.log(e.detail); // { name: 'TIPT', version: '0.0.0', capabilities: ['l402', 'lightning-invoice'] }
+  console.log(e.detail);
+  // { name: 'TIPT', version: '0.0.0', capabilities: ['l402', 'lightning-invoice'] }
 });
 
 // Site can request a fresh announcement
@@ -96,11 +113,14 @@ The site dispatches `mpp:pay` with the invoice and challenge details. TIPT pays 
 // Site requests payment
 window.dispatchEvent(new CustomEvent('mpp:pay', {
   detail: {
-    requestId: 'unique-id',   // Correlated in the response
-    invoice: 'lnbc...',       // BOLT11 invoice
-    scheme: 'L402',           // Optional: 'L402' | 'Payment' | other
-    macaroon: '...',          // Optional: for L402
-    paymentChallenge: { ... } // Optional: for Payment/MPP scheme
+    requestId: 'unique-id',        // Correlated in the response
+    invoice: 'lnbc...',            // BOLT11 invoice (required)
+    scheme: 'L402',                // Optional: 'L402' | 'Payment' | other
+    macaroon: '...',               // Optional: for L402
+    token: '...',                  // Optional
+    paymentChallenge: {            // Optional: for Payment/MPP scheme
+      id, realm, method, intent, request, expires?, opaque?
+    }
   }
 }));
 
@@ -125,8 +145,8 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
 
 ### Approval flow
 1. Site dispatches `mpp:pay` with invoice and challenge details.
-2. Content script forwards to the background service worker.
-3. Background checks if the host is on the **allowlist** (auto-approve) or prompts the user via a `window.confirm` dialog.
+2. Content script forwards to the background service worker as `TIPT_402_PAY_REQUEST` with `source: 'mpp'`.
+3. Background checks if the host is on the **allowlist** (auto-approve) or prompts the user via a `window.confirm` dialog in the content script.
 4. User can optionally choose "Remember this host" to add it to the allowlist.
 5. Background pays the invoice via the offscreen document and returns an `Authorization` header value.
 6. Content script dispatches `mpp:payresponse` back to the page.
@@ -142,21 +162,36 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
 
 ```
 ┌─────────────────────────────────────┐
-│  Popup (React)                      │  Wallet UI — setup, unlock, send, receive
+│  Popup (React — App.tsx)            │  Wallet UI — setup, unlock, send, receive
 └────────────────┬────────────────────┘
-                 │ chrome.storage
+                 │ chrome.storage / chrome.runtime
 ┌────────────────▼────────────────────┐
 │  Background Service Worker          │  402 orchestration, allowlist, icon badge
+│  (background.ts)                    │
 └────┬───────────────────┬────────────┘
      │ chrome.tabs msg   │ chrome.runtime msg
-┌────▼──────┐   ┌────────▼────────────┐
-│ Content   │   │ Offscreen Document  │  Spark SDK wallet instance
-│ Script    │   │ (wallet-service.ts) │
-└────┬──────┘   └─────────────────────┘
-     │ CustomEvents (mpp:announce, mpp:pay, mpp:payresponse)
-     │
+┌────▼──────────┐  ┌─────▼───────────────┐
+│ Content Script│  │ Offscreen Document  │  Spark SDK wallet instance
+│ (content.ts)  │  │ (wallet-service.ts) │
+└────┬──────────┘  └─────────────────────┘
+     │ CustomEvents
+     │ mpp:announce  (TIPT → page)
+     │ mpp:request   (page → TIPT)
+     │ mpp:pay       (page → TIPT)
+     │ mpp:payresponse (TIPT → page)
   Page JS
 ```
+
+---
+
+## Manifest
+
+- **Manifest version**: 3
+- **Permissions**: `tabs`, `storage`, `offscreen`
+- **Host permissions**: `<all_urls>`
+- **Content script**: `content.js` injected at `document_start` on all URLs
+- **Background**: `background.js` module service worker
+- **CSP**: `script-src 'self' 'wasm-unsafe-eval'` (required for Spark SDK WASM)
 
 ---
 
