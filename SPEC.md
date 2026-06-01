@@ -50,7 +50,7 @@ The Send panel accepts Lightning Addresses and LNURLs. Both resolve via LNURL-pa
 
 The send UI is a single screen with two labeled fields:
 - **Recipient** — Lightning Address (e.g. `user@domain.com`) or LNURL
-- **₿** — Amount in satoshis, with a **Send Max** button
+- **Amount** — Amount in bitcoin (satoshis), with a **Send Max** button
 
 Tapping **Review & Pay**:
 1. If the LNURL has not yet been resolved, it is resolved now to fetch min/max sendable and the callback URL.
