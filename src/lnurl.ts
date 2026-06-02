@@ -1,4 +1,5 @@
 import { bech32 } from 'bech32';
+import { safeJsonFetch } from './lib/http';
 
 export interface LnurlPayInfo {
   callback: string;
@@ -19,7 +20,14 @@ function lightningAddressToUrl(address: string): string {
 }
 
 function isDisallowedHost(host: string): boolean {
-  const h = host.toLowerCase();
+  // Normalise: lowercase + drop trailing FQDN dot. URL.hostname doesn't
+  // include the dot when the URL is parsed (`https://foo.local./` → `foo.local`),
+  // but a literal trailing dot can slip in via direct string callers. The
+  // dot is purely a DNS root indicator and doesn't change the resolved host,
+  // so endsWith-checks like `.local` / `.onion` would otherwise miss
+  // `foo.local.` / `bar.onion.`.
+  let h = host.toLowerCase();
+  if (h.endsWith('.')) h = h.slice(0, -1);
 
   // Block well-known local / special-use names.
   if (h === 'localhost' || h === '0.0.0.0') return true;
@@ -58,10 +66,28 @@ function assertSafeUrl(rawUrl: string): URL {
   return url;
 }
 
-// Default fetch options used for every LNURL HTTP call. `redirect: 'error'`
-// turns any 3xx response into a network error, so a server cannot redirect us
-// to a private network or a non-HTTPS scheme after the initial assertSafeUrl.
-const LNURL_FETCH_OPTIONS: RequestInit = { redirect: 'error' };
+// Bounded fetch parameters for every LNURL HTTP call. `safeJsonFetch`
+// sets `redirect: 'error'` so a server can't redirect us to a private
+// network or non-HTTPS scheme after the initial assertSafeUrl; the timeout
+// and byte cap defend against hung sockets and oversized responses.
+const LNURL_TIMEOUT_MS = 10_000;
+const LNURL_MAX_BYTES = 32 * 1024;
+
+interface LnurlPayResponse {
+  tag?: unknown;
+  status?: string;
+  reason?: string;
+  callback?: unknown;
+  minSendable?: unknown;
+  maxSendable?: unknown;
+  metadata?: unknown;
+}
+
+interface LnurlInvoiceResponse {
+  status?: string;
+  reason?: string;
+  pr?: unknown;
+}
 
 export async function resolveLnurlPayInfo(input: string): Promise<LnurlPayInfo> {
   let url: string;
@@ -76,13 +102,22 @@ export async function resolveLnurlPayInfo(input: string): Promise<LnurlPayInfo> 
   }
 
   const safeUrl = assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString(), LNURL_FETCH_OPTIONS);
-  if (!res.ok) throw new Error(`LNURL fetch failed: ${res.status}`);
-  const data = await res.json();
+  const data = await safeJsonFetch<LnurlPayResponse>(safeUrl.toString(), {
+    timeoutMs: LNURL_TIMEOUT_MS,
+    maxBytes: LNURL_MAX_BYTES,
+  });
   if (data && data.status === 'ERROR') throw new Error(data.reason ?? 'LNURL error');
 
   if (!data || typeof data !== 'object') {
     throw new Error('LNURL response was not a JSON object.');
+  }
+  // Reject non-payRequest LNURL types (lnurl-auth, lnurl-withdraw, etc.) —
+  // they happen to share fields with payRequest in some implementations but
+  // mean very different things. Accepting one as a payRequest could let a
+  // malicious server trick the popup into paying when the user intended a
+  // different LNURL flow.
+  if (typeof data.tag !== 'string' || data.tag !== 'payRequest') {
+    throw new Error('Not a payRequest LNURL endpoint.');
   }
   if (typeof data.callback !== 'string' || data.callback.length === 0) {
     throw new Error('LNURL response missing "callback" string.');
@@ -99,7 +134,7 @@ export async function resolveLnurlPayInfo(input: string): Promise<LnurlPayInfo> 
 
   let description = '';
   try {
-    const meta: [string, string][] = JSON.parse(data.metadata);
+    const meta: [string, string][] = JSON.parse(data.metadata as string);
     const t = meta.find(([type]) => type === 'text/plain');
     if (t) description = t[1];
   } catch { /**/ }
@@ -116,11 +151,16 @@ export async function fetchInvoiceFromCallback(
   callback: string,
   amountMsats: number,
 ): Promise<string> {
-  const url = `${callback}${callback.includes('?') ? '&' : '?'}amount=${amountMsats}`;
-  const safeUrl = assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString(), LNURL_FETCH_OPTIONS);
-  if (!res.ok) throw new Error(`Invoice fetch failed: ${res.status}`);
-  const data = await res.json();
+  // Use URL parsing for amount append so a callback containing a `#fragment`
+  // does NOT end up with `amount=...` inside the fragment (string concat
+  // with `?`/`&` puts it after the fragment when the URL has one).
+  const callbackUrl = assertSafeUrl(callback);
+  callbackUrl.searchParams.set('amount', String(amountMsats));
+  const safeUrl = assertSafeUrl(callbackUrl.toString());
+  const data = await safeJsonFetch<LnurlInvoiceResponse>(safeUrl.toString(), {
+    timeoutMs: LNURL_TIMEOUT_MS,
+    maxBytes: LNURL_MAX_BYTES,
+  });
   if (data && data.status === 'ERROR') throw new Error(data.reason ?? 'Invoice error');
   if (!data || typeof data.pr !== 'string' || data.pr.length === 0) {
     throw new Error('Invoice response missing "pr" string.');

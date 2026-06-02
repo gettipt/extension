@@ -1,14 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
-  deriveKey, encryptText, decryptText, hexToBuf, bufToHex,
-  PBKDF2_ITERATIONS_DEFAULT, PBKDF2_ITERATIONS_LEGACY,
+  deriveKey, encryptText, decryptText, bufToHex,
+  PBKDF2_ITERATIONS_DEFAULT,
 } from './crypto'
 import { resolveLnurlPayInfo, fetchInvoiceFromCallback } from './lnurl'
 import type { LnurlPayInfo } from './lnurl'
 import { getItem, setItem, removeItem, getSynced, setItemDual, setItemsDual, removeItemDual } from './lib/storage'
 import { storeUnlockKey, loadUnlockKey, clearUnlockKey } from './lib/key-store'
 import { sendWalletMessage, connectWalletPort } from './lib/wallet-client'
+import { MSG } from './lib/messages'
 import { getMaxFeeSats, getMaxSpendableSats } from './lib/fees'
+import { useBtcUsdRate } from './hooks/useBtcUsdRate'
+import { scrubLegacyState } from './lib/migrate-legacy'
 import type { WalletTransfer } from './lib/transfers'
 import type { SendStep } from './lib/send-types'
 import {
@@ -22,10 +25,8 @@ import {
   BTC_USD_RATE_CACHE_KEY,
 } from './constants'
 import {
-  getPinAttempts,
-  setPinAttempts,
   clearPinAttempts,
-  getLockoutForAttempts,
+  verifyPin,
 } from './lib/pin-attempts'
 import { InitializingScreen } from './components/InitializingScreen'
 import { LoadingScreen } from './components/LoadingScreen'
@@ -35,6 +36,8 @@ import { PinLockScreen } from './components/PinLockScreen'
 import { IdleScreen } from './components/IdleScreen'
 import { BackupPromptScreen } from './components/BackupPromptScreen'
 import { ReadyScreen } from './components/ready/ReadyScreen'
+import { PinPromptModal } from './components/PinPromptModal'
+import { TrustedSitesScreen } from './components/TrustedSitesScreen'
 
 // Types
 type AppState =
@@ -46,6 +49,7 @@ type AppState =
   | 'recovering'
   | 'backup-prompt'
   | 'ready'
+  | 'trusted-sites'
   | 'error';
 
 type PinSetupStep = 'enter' | 'confirm';
@@ -54,12 +58,15 @@ type PendingWalletAction =
   | { type: 'create' }
   | { type: 'recover'; mnemonic: string; fromFile?: boolean }
   | null;
+type PinGatedAction = 'backup' | 'delete' | null;
 
 interface WalletData {
   mnemonic: string;
   balanceSats: bigint;
   recovered: boolean;
 }
+
+type AfterUnlockResult = 'ok' | 'no-wallet' | 'decrypt-failed';
 
 export default function App() {
   const [appState, setAppState] = useState<AppState>('initializing');
@@ -72,7 +79,7 @@ export default function App() {
   const [pinLoading, setPinLoading] = useState(false);
 
   const [walletData, setWalletData] = useState<WalletData | null>(null);
-  const [btcUsdRate, setBtcUsdRate] = useState<number | null>(null);
+  const btcUsdRate = useBtcUsdRate();
   const [recoverInput, setRecoverInput] = useState('');
   const [showRecover, setShowRecover] = useState(false);
   const [backupDownloaded, setBackupDownloaded] = useState(false);
@@ -90,7 +97,12 @@ export default function App() {
   const [sendError, setSendError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
   const [sendTxId, setSendTxId] = useState<string | null>(null);
-  const [isSendMax, setIsSendMax] = useState(false);
+  // isSendMax is a flag set by the Send panel's "MAX" button and read once
+  // by handleSendPayment. Using a ref instead of state prevents an extra
+  // render pass on every "MAX" press and avoids stale-closure bugs since
+  // the value is consumed synchronously inside the next onClick.
+  const isSendMaxRef = useRef(false);
+  const setIsSendMax = useCallback((v: boolean) => { isSendMaxRef.current = v; }, []);
   const [pendingBolt11, setPendingBolt11] = useState<string | null>(null);
   const [feeEstimateSats, setFeeEstimateSats] = useState<number | null>(null);
   const [pendingWalletAction, setPendingWalletAction] = useState<PendingWalletAction>(null);
@@ -101,17 +113,23 @@ export default function App() {
   const [loadingTransfers, setLoadingTransfers] = useState(false);
   const [transfersError, setTransfersError] = useState<string | null>(null);
   const [showAllTransfers, setShowAllTransfers] = useState(false);
+  const [pendingPinAction, setPendingPinAction] = useState<PinGatedAction>(null);
 
   const prevBalanceRef = useRef<bigint | null>(null);
   const activePanelRef = useRef<ActivePanel>(null);
   activePanelRef.current = activePanel;
   const cryptoKeyRef = useRef<CryptoKey | null>(null);
 
-  const downloadBackupFile = useCallback(async () => {
+  const downloadBackupFile = useCallback(async (verifiedKey?: CryptoKey) => {
     let mnemonic = walletData?.mnemonic ?? '';
     if (!mnemonic) {
       const walletRaw = await getSynced(WALLET_KEY);
-      const key = cryptoKeyRef.current;
+      // Prefer the key the caller just re-derived from a freshly-entered
+      // PIN. Falling back to cryptoKeyRef means we honour the existing
+      // unlocked session for non-sensitive callers, but the PIN-prompt path
+      // always supplies its own key so the export is gated on knowing the
+      // PIN even if the in-memory key has been compromised.
+      const key = verifiedKey ?? cryptoKeyRef.current;
       if (!walletRaw || !key) return;
       try {
         const { iv, ct } = JSON.parse(walletRaw);
@@ -129,9 +147,39 @@ export default function App() {
     URL.revokeObjectURL(url);
   }, [walletData]);
 
+  const loadTransfers = useCallback(async () => {
+    setLoadingTransfers(true);
+    setTransfersError(null);
+    try {
+      const response = await sendWalletMessage<{
+        ok: boolean;
+        transfers?: unknown[];
+        error?: string;
+      }>({ type: MSG.GET_TRANSFERS, payload: { limit: 10, offset: 0 } });
+      if (!response.ok) throw new Error(response.error ?? 'Failed to load transfers.');
+      const normalized = (response.transfers ?? [])
+        .map((item) => (typeof item === 'object' && item !== null ? (item as WalletTransfer) : null))
+        .filter((item): item is WalletTransfer => item !== null);
+      setRecentTransfers(normalized);
+      const key = cryptoKeyRef.current;
+      if (key) {
+        try {
+          const encrypted = await encryptText(key, JSON.stringify(normalized));
+          await setItem('local', TRANSFERS_CACHE_KEY, JSON.stringify(encrypted));
+        } catch { /* ignore encryption/quota errors */ }
+      }
+    } catch (err) {
+      setTransfersError(err instanceof Error ? err.message : 'Failed to load transfer history.');
+    } finally {
+      setLoadingTransfers(false);
+    }
+  }, []);
+
   useEffect(() => {
     const current = walletData?.balanceSats ?? null;
     const prev = prevBalanceRef.current;
+    let flashTimer: ReturnType<typeof setTimeout> | null = null;
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     if (current !== null && prev !== null && current > prev) {
       if (activePanelRef.current === 'receive') {
         setActivePanel(null);
@@ -139,15 +187,22 @@ export default function App() {
         setInvoice(null);
       }
       setBalanceFlash(true);
-      setTimeout(() => setBalanceFlash(false), 500);
+      flashTimer = setTimeout(() => setBalanceFlash(false), 500);
     }
     prevBalanceRef.current = current;
-    if (walletData) {
-      const id = setTimeout(() => { void loadTransfers(); }, 500);
-      return () => clearTimeout(id);
+    if (current !== null) {
+      // 1.5s debounce: balance update events arrive in bursts during a
+      // single payment (transfer:claimed, deposit:confirmed, getBalance
+      // refresh after a send) — bumping the debounce avoids 2–3 redundant
+      // getTransfers calls per real-world payment without making the
+      // history feel laggy.
+      reloadTimer = setTimeout(() => { void loadTransfers(); }, 1500);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [walletData?.balanceSats]);
+    return () => {
+      if (flashTimer !== null) clearTimeout(flashTimer);
+      if (reloadTimer !== null) clearTimeout(reloadTimer);
+    };
+  }, [walletData?.balanceSats, loadTransfers]);
 
   const doInitWallet = async (
     mnemonicOrSeed: string | undefined,
@@ -155,7 +210,6 @@ export default function App() {
     recovered: boolean,
   ) => {
     try {
-      cryptoKeyRef.current = key;
       const cachedTransfersPromise = (async () => {
         try {
           const cachedRaw = await getItem('local', TRANSFERS_CACHE_KEY);
@@ -173,12 +227,19 @@ export default function App() {
         mnemonic?: string;
         balanceSats?: string;
         error?: string;
-      }>({ type: 'TIPT_WALLET_CREATE', payload: { mnemonic: mnemonicOrSeed } });
+      }>({ type: MSG.WALLET_CREATE, payload: { mnemonic: mnemonicOrSeed } });
       if (!response.ok) throw new Error(response.error ?? 'Failed to initialize wallet.');
       const mnemonic = response.mnemonic ?? mnemonicOrSeed ?? '';
       const balanceSats = BigInt(response.balanceSats ?? '0');
       const encrypted = await encryptText(key, mnemonic);
       await setItemDual(WALLET_KEY, JSON.stringify(encrypted));
+      // Only stamp the in-memory key ref AFTER the ciphertext is durably on
+      // disk — the ref's invariant is "points to a key whose ciphertext can
+      // be decrypted next time the offscreen calls loadUnlockKey()". If we
+      // stamp earlier and the setItemDual write fails, downstream callers
+      // (e.g. loadTransfers's cache-write) would encrypt against a key that
+      // doesn't match any persisted wallet blob.
+      cryptoKeyRef.current = key;
       const cachedTransfers = await cachedTransfersPromise;
       if (cachedTransfers) setRecentTransfers(cachedTransfers);
       setWalletData({ mnemonic, balanceSats, recovered });
@@ -198,17 +259,18 @@ export default function App() {
     }
   };
 
-  const afterUnlock = useCallback(async (key: CryptoKey) => {
+  const afterUnlock = useCallback(async (key: CryptoKey): Promise<AfterUnlockResult> => {
     const walletRaw = await getSynced(WALLET_KEY);
-    if (!walletRaw) { setAppState('idle'); return; }
+    if (!walletRaw) { setAppState('idle'); return 'no-wallet'; }
     skipBackupRef.current = true;
     setAppState('recovering');
     try {
       const { iv, ct } = JSON.parse(walletRaw);
       const mnemonic = await decryptText(key, iv, ct);
       await doInitWallet(mnemonic, key, true);
+      return 'ok';
     } catch {
-      setAppState('idle');
+      return 'decrypt-failed';
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -220,23 +282,26 @@ export default function App() {
       // Best-effort cleanup of the legacy plaintext PIN entry from pre-S7
       // installs. The background's onStartup listener handles browser
       // restarts; this catches the in-session upgrade case.
-      void chrome.storage.session.remove(LEGACY_SESSION_PIN_KEY).catch(() => { /* ignore */ });
+      scrubLegacyState();
 
-      const storedWallet = await getSynced(WALLET_KEY);
-      const cachedKey = await loadUnlockKey();
+      const [storedWallet, cachedKey] = await Promise.all([
+        getSynced(WALLET_KEY),
+        loadUnlockKey(),
+      ]);
 
       if (storedWallet && cachedKey) {
-        try {
-          if (!cancelled) {
-            await afterUnlock(cachedKey);
-          }
-          return;
-        } catch {
-          // The cached key didn't match the stored wallet (e.g. the wallet
-          // was rotated on another device). Wipe the stale key and fall
-          // through to the lock screen.
-          await clearUnlockKey();
-        }
+        if (cancelled) return;
+        const result = await afterUnlock(cachedKey);
+        if (cancelled) return;
+        if (result === 'ok') return;
+        // The cached key didn't match the stored wallet (e.g. the wallet
+        // was rotated on another device). Wipe the stale key and fall
+        // through to the lock screen so the user can re-derive a working
+        // key from their PIN.
+        await clearUnlockKey();
+        cryptoKeyRef.current = null;
+        setAppState('pin-lock');
+        return;
       }
 
       if (!cancelled) {
@@ -249,88 +314,17 @@ export default function App() {
     };
   }, [afterUnlock]);
 
-  const refreshBtcUsdRate = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', { signal });
-      if (!response.ok) return;
-      const data = await response.json() as { bitcoin?: { usd?: number } };
-      const nextRate = data.bitcoin?.usd;
-      if (typeof nextRate === 'number' && Number.isFinite(nextRate)) {
-        setBtcUsdRate(nextRate);
-        // Persist so the next popup open shows a number immediately instead
-        // of '--' while CoinGecko is reached. We cache value + timestamp so
-        // a future enhancement can decide on staleness — today we always
-        // refresh on mount so the cached value is just a visual seed.
-        void setItem('local', BTC_USD_RATE_CACHE_KEY, JSON.stringify({ rate: nextRate, ts: Date.now() }))
-          .catch(() => { /* ignore quota errors; the price isn't critical */ });
-      }
-    } catch {
-      // Ignore transient pricing errors and keep the last known rate.
-    }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    // Seed from the persisted cache so we don't render '--' on every popup
-    // open while waiting for CoinGecko.
-    void (async () => {
-      try {
-        const raw = await getItem('local', BTC_USD_RATE_CACHE_KEY);
-        if (cancelled || !raw) return;
-        const parsed = JSON.parse(raw) as { rate?: number };
-        if (typeof parsed.rate === 'number' && Number.isFinite(parsed.rate)) {
-          setBtcUsdRate((prev) => prev ?? parsed.rate!);
-        }
-      } catch { /* ignore */ }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void refreshBtcUsdRate(controller.signal);
-    const timer = setInterval(() => {
-      void refreshBtcUsdRate(controller.signal);
-    }, 300000);
-    return () => {
-      clearInterval(timer);
-      controller.abort();
-    };
-  }, [refreshBtcUsdRate]);
-
+  // Auto-reset the send panel 5s after a successful payment. We capture
+  // the live `handleSend` in a ref updated each render so the effect's
+  // deps stay just `[sendStep]` (we only want to re-arm the timer on
+  // a step transition, not on every other re-render) without tripping
+  // the exhaustive-deps lint rule.
+  const handleSendRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (sendStep !== 'success') return;
-    const timer = setTimeout(() => handleSend(), 5000);
+    const timer = setTimeout(() => handleSendRef.current(), 5000);
     return () => clearTimeout(timer);
-  }, [sendStep]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const loadTransfers = useCallback(async () => {
-    setLoadingTransfers(true);
-    setTransfersError(null);
-    try {
-      const response = await sendWalletMessage<{
-        ok: boolean;
-        transfers?: unknown[];
-        error?: string;
-      }>({ type: 'TIPT_GET_TRANSFERS', payload: { limit: 10, offset: 0 } });
-      if (!response.ok) throw new Error(response.error ?? 'Failed to load transfers.');
-      const normalized = (response.transfers ?? [])
-        .map((item) => (typeof item === 'object' && item !== null ? (item as WalletTransfer) : null))
-        .filter((item): item is WalletTransfer => item !== null);
-      setRecentTransfers(normalized);
-      const key = cryptoKeyRef.current;
-      if (key) {
-        try {
-          const encrypted = await encryptText(key, JSON.stringify(normalized));
-          await setItem('local', TRANSFERS_CACHE_KEY, JSON.stringify(encrypted));
-        } catch { /* ignore encryption/quota errors */ }
-      }
-    } catch (err) {
-      setTransfersError(err instanceof Error ? err.message : 'Failed to load transfer history.');
-    } finally {
-      setLoadingTransfers(false);
-    }
-  }, []);
+  }, [sendStep]);
 
   useEffect(() => {
     const unsubscribe = connectWalletPort((event) => {
@@ -394,37 +388,20 @@ export default function App() {
     setPinLoading(true);
     setPinError(null);
     try {
-      const attempts = await getPinAttempts();
-      const now = Date.now();
-      if (attempts.lockedUntil > now) {
-        const seconds = Math.ceil((attempts.lockedUntil - now) / 1000);
-        setPinError(`Too many attempts. Try again in ${seconds}s.`);
+      const verifyResult = await verifyPin(pin);
+      if (!verifyResult.ok) {
+        if (verifyResult.reason === 'locked') {
+          const seconds = Math.ceil((verifyResult.lockedUntil - Date.now()) / 1000);
+          setPinError(`Too many attempts. Try again in ${seconds}s.`);
+        } else if (verifyResult.reason === 'no-data') {
+          setPinError('Wallet found, but PIN data has not synced yet. Please try again shortly.');
+        } else {
+          setPinError('Incorrect PIN. Please try again.');
+        }
         setPinInput('');
         return;
       }
-      const pinRaw = await getSynced(PIN_KEY);
-      if (!pinRaw) throw new Error('PIN_NOT_FOUND');
-      const { salt, verifier, iterations } = JSON.parse(pinRaw);
-      const storedIterations = typeof iterations === 'number' && Number.isFinite(iterations)
-        ? iterations
-        : PBKDF2_ITERATIONS_LEGACY;
-      const key = await deriveKey(pin, hexToBuf(salt), storedIterations);
-      let result: string;
-      try {
-        result = await decryptText(key, verifier.iv, verifier.ct);
-      } catch {
-        const newCount = attempts.count + 1;
-        const lockoutMs = getLockoutForAttempts(newCount);
-        await setPinAttempts({ count: newCount, lockedUntil: lockoutMs ? now + lockoutMs : 0 });
-        throw new Error('Wrong PIN.');
-      }
-      if (result !== SENTINEL) {
-        const newCount = attempts.count + 1;
-        const lockoutMs = getLockoutForAttempts(newCount);
-        await setPinAttempts({ count: newCount, lockedUntil: lockoutMs ? now + lockoutMs : 0 });
-        throw new Error('Wrong PIN.');
-      }
-      await clearPinAttempts();
+      const { key, iterations: storedIterations } = verifyResult;
       // S7: stash the derived AES key in shared IndexedDB. This replaces the
       // previous `chrome.storage.session.set('spark_session_pin', pin)` —
       // the raw PIN is now never persisted anywhere on disk or in
@@ -468,14 +445,8 @@ export default function App() {
 
       setPinInput('');
       await afterUnlock(key);
-    } catch (err) {
-      setPinError(
-        err instanceof Error && err.message === 'PIN_NOT_FOUND'
-          ? 'Wallet found, but PIN data has not synced yet. Please try again shortly.'
-          : err instanceof Error && err.message.startsWith('Too many attempts')
-            ? err.message
-            : 'Incorrect PIN. Please try again.',
-      );
+    } catch {
+      setPinError('Incorrect PIN. Please try again.');
       setPinInput('');
     } finally {
       setPinLoading(false);
@@ -494,7 +465,7 @@ export default function App() {
       setFetchingInvoice(true);
       try {
         const r = await sendWalletMessage<{ ok: boolean; invoice?: string; error?: string }>({
-          type: 'TIPT_CREATE_INVOICE',
+          type: MSG.CREATE_INVOICE,
           payload: { amountSats: 0 },
         });
         if (r.ok && r.invoice) {
@@ -521,16 +492,16 @@ export default function App() {
     setFeeEstimateSats(null);
     setIsSendMax(false);
   };
+  // Keep the ref consumed by the success-reset effect pointing at the
+  // current closure (state setters from this render).
+  handleSendRef.current = handleSend;
 
   const handleDeleteWalletAndReset = async () => {
-    const confirmed = globalThis.confirm('Clicking OK will delete your wallet and cannot be undone.');
-    if (!confirmed) return;
-
     try {
       // Tear down the offscreen wallet first so a stale SDK instance can't
       // leak after the user has cleared their credentials.
       try {
-        await sendWalletMessage({ type: 'TIPT_DISPOSE_WALLET' });
+        await sendWalletMessage({ type: MSG.DISPOSE_WALLET });
       } catch {
         // Best-effort; reset proceeds even if the offscreen document is gone.
       }
@@ -596,7 +567,7 @@ export default function App() {
     const balanceSats = Number(walletData.balanceSats);
     let effectiveAmountSats: number;
 
-    if (isSendMax) {
+    if (isSendMaxRef.current) {
       // Deduct fee from balance so total never exceeds balance.
       const lnurlCap = payInfo ? Math.floor(payInfo.maxSendableMsats / 1000) : Infinity;
       effectiveAmountSats = Math.min(getMaxSpendableSats(balanceSats), lnurlCap);
@@ -633,7 +604,7 @@ export default function App() {
       let fee: number | null = null;
       try {
         const feeResponse = await sendWalletMessage<{ ok: boolean; feeSats?: number; error?: string }>({
-          type: 'TIPT_GET_FEE_ESTIMATE',
+          type: MSG.GET_FEE_ESTIMATE,
           payload: { encodedInvoice: bolt11 },
         });
         fee = feeResponse.ok && feeResponse.feeSats !== undefined ? feeResponse.feeSats : getMaxFeeSats(effectiveAmountSats);
@@ -656,7 +627,7 @@ export default function App() {
         // Re-estimate fee for the adjusted amount; reuse safeFee if SDK call fails.
         try {
           const feeResponse2 = await sendWalletMessage<{ ok: boolean; feeSats?: number; error?: string }>({
-            type: 'TIPT_GET_FEE_ESTIMATE',
+            type: MSG.GET_FEE_ESTIMATE,
             payload: { encodedInvoice: bolt11 },
           });
           fee = feeResponse2.ok && feeResponse2.feeSats !== undefined ? feeResponse2.feeSats : safeFee;
@@ -689,7 +660,7 @@ export default function App() {
       // the AES key from shared IndexedDB if it needs to re-initialise.
       const walletRaw = await getSynced(WALLET_KEY);
       const result = await sendWalletMessage<{ ok: boolean; txId?: string; error?: string }>({
-        type: 'TIPT_PAY_INVOICE',
+        type: MSG.PAY_INVOICE,
         payload: {
           invoice: pendingBolt11,
           maxFeeSats,
@@ -700,7 +671,7 @@ export default function App() {
       setSendTxId(result.txId ?? null);
       setSendStep('success');
       const balResponse = await sendWalletMessage<{ ok: boolean; balance?: string; error?: string }>({
-        type: 'TIPT_GET_BALANCE',
+        type: MSG.GET_BALANCE,
       });
       if (balResponse.ok && balResponse.balance !== undefined) {
         setWalletData((prev) => (prev ? { ...prev, balanceSats: BigInt(balResponse.balance!) } : prev));
@@ -820,8 +791,9 @@ export default function App() {
 
       {appState === 'ready' && walletData && (
         <ReadyScreen
-          onBackup={() => { void downloadBackupFile(); }}
-          onDelete={() => { void handleDeleteWalletAndReset(); }}
+          onBackup={() => { setPendingPinAction('backup'); }}
+          onDelete={() => { setPendingPinAction('delete'); }}
+          onTrustedSites={() => { setAppState('trusted-sites'); }}
           satsDisplay={satsDisplay}
           usdDisplay={usdDisplay}
           usdPrimary={usdPrimary}
@@ -862,6 +834,33 @@ export default function App() {
           fetchingInvoice={fetchingInvoice}
           invoiceCopied={invoiceCopied}
           onInvoiceCopy={handleInvoiceCopy}
+        />
+      )}
+
+      {appState === 'trusted-sites' && (
+        <TrustedSitesScreen onBack={() => { setAppState('ready'); }} />
+      )}
+
+      {pendingPinAction && (
+        <PinPromptModal
+          title={pendingPinAction === 'backup' ? 'Confirm to back up' : 'Confirm wallet deletion'}
+          description={pendingPinAction === 'backup'
+            ? 'Re-enter your PIN to export your recovery phrase.'
+            : 'Re-enter your PIN to permanently delete this wallet from this device. This cannot be undone.'}
+          confirmLabel={pendingPinAction === 'backup' ? 'Back up' : 'Delete wallet'}
+          destructive={pendingPinAction === 'delete'}
+          onCancel={() => setPendingPinAction(null)}
+          onConfirm={async (verifiedKey) => {
+            const action = pendingPinAction;
+            setPendingPinAction(null);
+            if (action === 'backup') {
+              // Thread the just-verified key through so the export uses
+              // the freshly-derived key — never the cached in-memory one.
+              await downloadBackupFile(verifiedKey);
+            } else if (action === 'delete') {
+              await handleDeleteWalletAndReset();
+            }
+          }}
         />
       )}
     </div>

@@ -3,26 +3,11 @@
 import { SparkWallet } from '@buildonspark/spark-sdk';
 import { decryptText } from './crypto';
 import { loadUnlockKey } from './lib/key-store';
+import { getStringField } from './lib/object-helpers';
 
 interface WalletPayload {
   iv: string;
   ct: string;
-}
-
-function getResultString(result: unknown, keys: string[]): string | null {
-  if (!result || typeof result !== 'object') {
-    return null;
-  }
-
-  const data = result as Record<string, unknown>;
-  for (const key of keys) {
-    const value = data[key];
-    if (typeof value === 'string' && value.length > 0) {
-      return value;
-    }
-  }
-
-  return null;
 }
 
 const TERMINAL_FAILURE_STATUSES = new Set([
@@ -86,11 +71,8 @@ export async function ensureWalletFromBlob(walletRaw: string): Promise<SparkWall
 
   try {
     return await walletInitPromise;
-  } catch (error) {
-    walletInitPromise = null;
-    throw error;
   } finally {
-    if (cachedWallet) walletInitPromise = null;
+    walletInitPromise = null;
   }
 }
 
@@ -98,12 +80,18 @@ async function pollForPreimage(
   wallet: SparkWallet,
   requestId: string,
   maxWaitMs = 60_000,
-  intervalMs = 750,
 ): Promise<string> {
   const deadline = Date.now() + maxWaitMs;
+  // Exponential backoff capped at 5s. First poll fires at 200ms because
+  // most real Lightning routes settle in under 500ms; waiting 500ms before
+  // the first lookup was leaving easy latency on the table for the happy
+  // path. Long-settling routes still back off so we don't hammer the SDK.
+  let intervalMs = 200;
+  const maxIntervalMs = 5_000;
 
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, intervalMs));
+    intervalMs = Math.min(intervalMs * 2, maxIntervalMs);
 
     const req = await (wallet as unknown as {
       getLightningSendRequest: (id: string) => Promise<Record<string, unknown> | null>;
@@ -113,7 +101,7 @@ async function pollForPreimage(
       continue;
     }
 
-    const preimage = getResultString(req, ['paymentPreimage', 'preimage', 'payment_preimage']);
+    const preimage = getStringField(req, ['paymentPreimage', 'preimage', 'payment_preimage']);
     if (preimage) {
       return preimage;
     }
@@ -249,6 +237,42 @@ export async function getWalletBalance(): Promise<bigint> {
   return result.balance;
 }
 
+// Recursive in-place walk that converts every `bigint` to its decimal
+// string and clones objects/arrays. The Spark SDK occasionally surfaces
+// bigint values (uint64 proto fields) that silently break
+// `chrome.runtime.sendMessage` serialisation if forwarded as-is. The
+// previous implementation used `JSON.parse(JSON.stringify(...,replacer))`
+// which doubled the work and allocated twice the memory.
+//
+// Special cases that the generic `Object.entries` recursion would silently
+// destroy:
+//   - Date: enumerable own keys are empty, so we'd serialise to `{}` and
+//     the renderer would render "Unknown date" for every transfer.
+//   - Map / Set: same problem (no enumerable own keys).
+//   - Uint8Array / ArrayBuffer: not JSON-serialisable; not currently emitted
+//     by SDK transfer payloads, but we pass them through untouched so callers
+//     that intentionally use them aren't corrupted.
+function normaliseBigints(value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Map) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of value.entries()) out[String(k)] = normaliseBigints(v);
+    return out;
+  }
+  if (value instanceof Set) return Array.from(value, normaliseBigints);
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) return value;
+  if (Array.isArray(value)) return value.map(normaliseBigints);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = normaliseBigints(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 export async function getWalletTransfers(limit: number, offset: number): Promise<unknown[]> {
   if (!cachedWallet) throw new Error('Wallet not initialized.');
   const walletWithTransfers = cachedWallet as unknown as {
@@ -261,15 +285,7 @@ export async function getWalletTransfers(limit: number, offset: number): Promise
       ? (response as { transfers?: unknown }).transfers
       : response;
   if (!Array.isArray(transfers)) return [];
-  // Normalize through JSON so the result is safely transported via
-  // chrome.runtime.sendMessage. The Spark SDK's getTransfers occasionally
-  // returns objects whose values contain bigints (uint64 fields from the
-  // underlying proto), which silently break message serialization and would
-  // otherwise make transactions never appear in the popup.
-  const safe = JSON.parse(JSON.stringify(transfers, (_key, value) => {
-    if (typeof value === 'bigint') return value.toString();
-    return value;
-  })) as unknown[];
+  const safe = normaliseBigints(transfers) as unknown[];
   return safe.filter((item) => typeof item === 'object' && item !== null);
 }
 

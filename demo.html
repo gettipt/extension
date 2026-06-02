@@ -283,7 +283,7 @@
     <div id="responseEmpty" class="empty">No payment sent yet.</div>
     <div id="responseBox" class="response-box" style="display:none">
       <div class="response-header">
-        <span>mpp:payresponse</span>
+        <span>mpp:payResponse</span>
         <span id="responseBadge" class="badge"></span>
       </div>
       <pre id="responseJson"></pre>
@@ -406,13 +406,13 @@
     }
 
     // ── Wallet status ─────────────────────────────────────────────────────────
-    window.addEventListener('mpp:announce', (e) => {
+    window.addEventListener('mpp:response', (e) => {
       const detail = e.detail || {};
       document.getElementById('statusDot').className = 'status-dot detected';
       document.getElementById('statusText').textContent = `${detail.name || 'Wallet'} detected (v${detail.version || '?'})`;
       document.getElementById('statusCaps').textContent = (detail.capabilities || []).join(', ');
       document.getElementById('payBtn').disabled = false;
-      logEvent('mpp:announce', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}]`);
+      logEvent('mpp:response', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}]`);
     });
 
     // Request announcement on load
@@ -455,10 +455,10 @@
       }
 
       const requestId = crypto.randomUUID();
-      logEvent('mpp:pay', `requestId=${requestId.slice(0, 8)}…`);
+      logEvent('mpp:payRequest', `requestId=${requestId.slice(0, 8)}…`);
       btn.textContent = 'Waiting for TIPT…';
 
-      window.dispatchEvent(new CustomEvent('mpp:pay', {
+      window.dispatchEvent(new CustomEvent('mpp:payRequest', {
         detail: {
           requestId,
           invoice,
@@ -470,9 +470,9 @@
       function onResponse(e) {
         const d = e.detail || {};
         if (d.requestId !== requestId) return;
-        window.removeEventListener('mpp:payresponse', onResponse);
+        window.removeEventListener('mpp:payResponse', onResponse);
 
-        logEvent('mpp:payresponse', `approved=${d.approved}`);
+        logEvent('mpp:payResponse', `approved=${d.approved}`);
 
         const badge = document.getElementById('responseBadge');
         if (d.approved) {
@@ -490,11 +490,11 @@
         btn.textContent = 'Pay via TIPT';
       }
 
-      window.addEventListener('mpp:payresponse', onResponse);
+      window.addEventListener('mpp:payResponse', onResponse);
 
       // Timeout if no response in 90s
       setTimeout(() => {
-        window.removeEventListener('mpp:payresponse', onResponse);
+        window.removeEventListener('mpp:payResponse', onResponse);
         if (btn.textContent === 'Waiting for TIPT…') {
           setFormError('No response from TIPT after 90 seconds.');
           btn.disabled = false;

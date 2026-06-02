@@ -1,14 +1,5 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
 import './index.css';
 import ConfirmApp from './ConfirmApp';
+import { bootstrap } from './main-bootstrap';
 
-const tree = import.meta.env.DEV ? (
-  <StrictMode>
-    <ConfirmApp />
-  </StrictMode>
-) : (
-  <ConfirmApp />
-);
-
-createRoot(document.getElementById('confirm-root')!).render(tree);
+bootstrap('confirm-root', ConfirmApp);

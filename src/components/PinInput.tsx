@@ -9,13 +9,15 @@ export function PinInput({
   onSubmit?: (v: string) => void;
   disabled?: boolean;
 }) {
-  const refs = [
-    useRef<HTMLInputElement>(null),
-    useRef<HTMLInputElement>(null),
-    useRef<HTMLInputElement>(null),
-    useRef<HTMLInputElement>(null),
-    useRef<HTMLInputElement>(null),
-  ];
+  // Single ref array — earlier code allocated N separate `useRef` calls in
+  // a literal array, which (a) breaks hook rules if PIN_LENGTH ever changes,
+  // and (b) allocates more objects than needed.
+  const inputsRef = useRef<(HTMLInputElement | null)[]>([]);
+  const setInputRef = (i: number) => (el: HTMLInputElement | null) => {
+    inputsRef.current[i] = el;
+  };
+  const focusAt = (i: number) => inputsRef.current[i]?.focus();
+
   const digits = value.split('').concat(Array(PIN_LENGTH).fill('')).slice(0, PIN_LENGTH);
 
   const handleKey = (i: number, e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -23,7 +25,7 @@ export function PinInput({
       e.preventDefault();
       const next = value.slice(0, i > 0 && digits[i] === '' ? i - 1 : i);
       onChange(next);
-      refs[Math.max(0, digits[i] === '' ? i - 1 : i)]?.current?.focus();
+      focusAt(Math.max(0, digits[i] === '' ? i - 1 : i));
     } else if (e.key === 'Enter' && value.length === PIN_LENGTH) {
       onSubmit?.(value);
     }
@@ -36,7 +38,7 @@ export function PinInput({
     arr[i] = d;
     const next = arr.join('').slice(0, PIN_LENGTH);
     onChange(next);
-    if (i < PIN_LENGTH - 1) refs[i + 1]?.current?.focus();
+    if (i < PIN_LENGTH - 1) focusAt(i + 1);
     else if (next.length === PIN_LENGTH) onSubmit?.(next);
   };
 
@@ -45,7 +47,7 @@ export function PinInput({
       {digits.map((d, i) => (
         <input
           key={i}
-          ref={refs[i]}
+          ref={setInputRef(i)}
           type="password"
           inputMode="numeric"
           maxLength={1}
@@ -60,3 +62,4 @@ export function PinInput({
     </div>
   );
 }
+

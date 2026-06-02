@@ -11,7 +11,8 @@ export function BackupPromptScreen({ backupDownloaded, onDownload, onContinue }:
         <img src="/tiptgreen.svg" alt="TIPT" className="w-10 h-10 mx-auto mb-3" />
         <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Back Up Your Wallet</h2>
         <p className="text-xs text-neutral-500 mt-1">
-          Download your backup file and store it somewhere safe. It will help you recover your wallet if you lose access.
+          This file contains your wallet recovery phrase in <span className="font-semibold text-red-600 dark:text-red-400">plain text</span>.
+          Anyone with access to it can spend your funds. Store it somewhere only you can reach.
         </p>
       </div>
       <button

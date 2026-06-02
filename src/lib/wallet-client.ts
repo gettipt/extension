@@ -1,8 +1,7 @@
 /// <reference types="chrome" />
 
 import { ensureOffscreen } from './offscreen';
-
-export { ensureOffscreen };
+import { MSG } from './messages';
 
 export async function sendWalletMessage<T>(msg: Record<string, unknown>): Promise<T> {
   await ensureOffscreen();
@@ -38,3 +37,5 @@ export function connectWalletPort(onEvent: (e: WalletEvent) => void): () => void
     try { port?.disconnect(); } catch { /* ignore */ }
   };
 }
+
+export { MSG };

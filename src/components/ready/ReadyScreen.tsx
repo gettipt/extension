@@ -23,6 +23,7 @@ interface ReadyScreenProps {
   // Header
   onBackup: () => void;
   onDelete: () => void;
+  onTrustedSites: () => void;
 
   // Balance
   satsDisplay: string;
@@ -78,6 +79,7 @@ interface ReadyScreenProps {
 export function ReadyScreen({
   onBackup,
   onDelete,
+  onTrustedSites,
   satsDisplay,
   usdDisplay,
   usdPrimary,
@@ -103,7 +105,7 @@ export function ReadyScreen({
 }: ReadyScreenProps) {
   return (
     <div className="flex flex-col flex-1 space-y-3">
-      <ReadyHeader onBackup={onBackup} onDelete={onDelete} />
+      <ReadyHeader onBackup={onBackup} onDelete={onDelete} onTrustedSites={onTrustedSites} />
 
       <>
         <BalanceCard

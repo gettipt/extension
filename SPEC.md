@@ -20,8 +20,8 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 
 ### Unlock
 - On subsequent launches the user re-enters their PIN to unlock.
-- The session PIN is stored in `chrome.storage.session` (cleared when the browser closes).
-- If the session PIN is missing the wallet is considered locked; any background payment attempt will fail with a "Wallet is locked" error.
+- Successful unlock derives a non-extractable AES-GCM `CryptoKey` from the PIN via PBKDF2 and caches the key handle (never the raw PIN) in shared IndexedDB (`src/lib/key-store.ts`). The cache is wiped on `chrome.runtime.onStartup` so it behaves like a session-only value.
+- If the cached key is missing the wallet is considered locked; any background 402 payment attempt will fail with a "Wallet is locked" error.
 
 #### PIN attempt throttling
 - Failed PIN unlock attempts are tracked under `spark_pin_attempts` in `chrome.storage.local` as `{ count, lockedUntil }`.
@@ -37,7 +37,7 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 - `spark_pin` and `spark_wallet` are written to **both `chrome.storage.local` (fast, per-device) and `chrome.storage.sync` (cross-device propagation via the user's signed-in Chrome profile)**. Encrypted blobs are well under the per-item 8 KB sync quota.
 - Reads go through `getSynced(key)` (`src/lib/storage.ts`), which prefers `local` and falls back to `sync`. When a value is found only in `local` (e.g., a previous install that wrote to `local`-only), `getSynced` transparently backfills `sync`. When a value is found only in `sync` (e.g., a brand-new device signed into the same Chrome profile), `getSynced` caches it to `local` for subsequent fast reads.
 - Sync writes are best-effort: a failed `sync.set` (quota, disabled, etc.) does not block the local write. Reset (`removeItemDual`) clears both areas.
-- Device-only keys (`spark_pin_attempts`, `spark_transfers_cache`, `tipt_402_allowlist`, `spark_btc_usd_rate`) remain in their respective single areas — they are not synced. The PIN-derived AES-GCM `CryptoKey` is cached separately in shared **IndexedDB** (`src/lib/key-store.ts`) as a non-extractable handle — never as raw PIN bytes — and is cleared on browser startup so it behaves like the old session-only PIN.
+- Device-only keys (`spark_pin_attempts`, `spark_transfers_cache`, `tipt_402_allowlist`, `spark_btc_usd_rate`) remain in their respective single areas — they are not synced. The 402 allowlist is intentionally per-device: a user who trusts a host on their laptop must explicitly re-trust it on their phone. The PIN-derived AES-GCM `CryptoKey` is cached separately in shared **IndexedDB** (`src/lib/key-store.ts`) as a non-extractable handle — never as raw PIN bytes — and is cleared on browser startup so it behaves like the old session-only PIN.
 
 ### Network
 - Wallets connect to the **Spark SDK** on **Mainnet**.
@@ -57,8 +57,9 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 - The offscreen handler normalises each transfer through `JSON.parse(JSON.stringify(..., bigintReplacer))` before posting it across `chrome.runtime.sendMessage`. The Spark SDK's `getTransfers` response occasionally embeds `bigint` values (uint64 proto fields) that would otherwise silently break message serialisation and make transfers never appear in the popup.
 
 ### Settings
-- **Backup mnemonic** — downloads a plaintext `TIPT-Wallet-Backup.txt`. The in-memory mnemonic is cleared from React state once the app transitions to `ready`, so `downloadBackupFile()` is `async` and re-derives the mnemonic on demand by decrypting `spark_wallet` with the cached `CryptoKey`.
-- **Reset wallet** — confirms via `globalThis.confirm`, then `removeItemDual` clears `spark_pin` and `spark_wallet` from both `local` and `sync`; removes `spark_transfers_cache` and `spark_pin_attempts` from `local`; removes the session PIN; clears the in-memory key; and reloads to the setup screen.
+- **Backup mnemonic** — downloads a plaintext `TIPT-Wallet-Backup.txt`. The action is gated behind a re-prompt for the PIN via `PinPromptModal`, even when the wallet is already unlocked, so a brief moment of unattended-device access cannot exfiltrate the recovery phrase. The in-memory mnemonic is cleared from React state once the app transitions to `ready`, so `downloadBackupFile()` is `async` and re-derives the mnemonic on demand by decrypting `spark_wallet` with the cached `CryptoKey`. The download dialog warns explicitly that the file is plain text and grants full spending authority.
+- **Trusted Sites** — opens the `TrustedSitesScreen`, which lists every host on the 402 allowlist with its `maxSatsPerPayment`, `maxSatsPerDay`, and `spentToday` counters. Each row offers a "Remove" button. Read/write happens through `TIPT_402_ALLOWLIST_LIST` / `TIPT_402_ALLOWLIST_REMOVE` messages handled in the background service worker.
+- **Delete wallet** — gated behind the same PIN re-prompt (`PinPromptModal`, destructive variant). The previous `globalThis.confirm` dialog was removed in favour of the modal so the user has to actively reproduce the PIN before any data is wiped. On confirm, `removeItemDual` clears `spark_pin` and `spark_wallet` from both `local` and `sync`; `spark_transfers_cache`, `spark_pin_attempts`, and `spark_btc_usd_rate` are removed from `local`; the legacy `spark_session_pin` is dropped from `session`; the IndexedDB-cached AES key is cleared; and the page reloads to the setup screen.
 
 ---
 
@@ -70,6 +71,8 @@ The Send panel accepts Lightning Addresses and LNURLs. Both resolve via LNURL-pa
 - Only `https://` URLs are accepted.
 - The hostname must not be a loopback / private / link-local / multicast IPv4 literal, an IPv6 loopback / link-local / unique-local literal, `localhost`, a `.local` / `.localhost` name, or a `.onion` address.
 - The initial LNURL/`.well-known/lnurlp` URL **and** the `callback` URL returned by the server are both validated, so a malicious server cannot redirect TIPT to a private network for the invoice fetch.
+- The `.well-known/lnurlp` JSON response must include `tag === 'payRequest'`. Other LNURL response shapes (`login`, `withdrawRequest`, etc.) are rejected even when they happen to expose a `callback` field — the demo page already did this; the popup now does too.
+- The callback URL is composed with `URL` + `URLSearchParams.set('amount', …)` rather than naïve string concatenation, so a `callback` that contains a `#fragment` no longer ends up with `amount=` parsed inside the fragment instead of the query.
 
 ### Send flow
 
@@ -120,27 +123,27 @@ TIPT does not inject scripts or intercept network traffic. Instead, websites exp
 > **Build constraint:** Content scripts in Manifest V3 are loaded as **classic scripts, not ES modules** — `import` statements at the top of `content.ts` would cause a syntax error in the page. `src/content.ts` therefore inlines its own debug-logger and **must not import from any other module**. The popup, background, and offscreen entries are all module-loaded and may import freely.
 
 ### Wallet Advertisement
-TIPT only announces itself when asked. When the page dispatches `mpp:request`, the content script responds with `mpp:announce` and also notifies the background to set the icon badge green for that tab.
+TIPT only announces itself when asked. When the page dispatches `mpp:request`, the content script responds with `mpp:response` and also notifies the background to set the icon badge green for that tab.
 
 ```js
 // Site asks if a wallet is present
 window.dispatchEvent(new CustomEvent('mpp:request'));
 
 // TIPT responds
-window.addEventListener('mpp:announce', (e) => {
+window.addEventListener('mpp:response', (e) => {
   console.log(e.detail);
   // { name: 'TIPT', version: '0.0.0', capabilities: ['l402', 'lightning-invoice'] }
 });
 ```
 
-> **Note:** Always register the `mpp:announce` listener before dispatching `mpp:request`, since CustomEvents are synchronous.
+> **Note:** Always register the `mpp:response` listener before dispatching `mpp:request`, since CustomEvents are synchronous.
 
 ### Payment Request
-The site dispatches `mpp:pay` with the invoice and challenge details. TIPT pays the invoice and dispatches `mpp:payresponse` with the resulting `Authorization` header value.
+The site dispatches `mpp:payRequest` with the invoice and challenge details. TIPT pays the invoice and dispatches `mpp:payResponse` with the resulting `Authorization` header value.
 
 ```js
 // Site requests payment
-window.dispatchEvent(new CustomEvent('mpp:pay', {
+window.dispatchEvent(new CustomEvent('mpp:payRequest', {
   detail: {
     requestId: 'unique-id',        // Correlated in the response
     invoice: 'lnbc...',            // BOLT11 invoice (required)
@@ -154,7 +157,7 @@ window.dispatchEvent(new CustomEvent('mpp:pay', {
 }));
 
 // Site listens for the result
-window.addEventListener('mpp:payresponse', (e) => {
+window.addEventListener('mpp:payResponse', (e) => {
   const { requestId, approved, authorization, error } = e.detail;
   if (approved) {
     // Retry the original request with the Authorization header
@@ -173,21 +176,39 @@ window.addEventListener('mpp:payresponse', (e) => {
 The `Payment` credential echoes the challenge fields and embeds the preimage, serialized using **RFC 8785 JSON Canonicalization Scheme (JCS)** and base64url-encoded.
 
 ### Approval flow
-1. Site dispatches `mpp:pay` with invoice and challenge details.
-2. Content script forwards to the background service worker as `TIPT_402_PAY_REQUEST` with `source: 'mpp'`.
-3. Background checks if the host is on the **allowlist** (auto-approve) or opens a dedicated **confirm popup window** (`confirm.html`) via `chrome.windows.create({ type: 'popup', width: 380, height: 460 })`.
-4. The confirm popup renders `ConfirmApp` (`src/ConfirmApp.tsx`), which sends `TIPT_402_CONFIRM_READY` to the background to fetch the pending request details and then displays host / URL / invoice plus a "Remember this site" checkbox.
-5. The popup sends `TIPT_402_CONFIRM_RESPONSE` with `{ id, approved, remember }` and closes itself.
-6. If the user does not respond, the background **auto-declines after 5 minutes** (pending confirms are held in an in-memory `Map<id, PendingConfirm>` keyed by a `crypto.randomUUID()`; a timer auto-resolves on expiry).
-7. On approval, the background pays the invoice via the offscreen document and returns an `Authorization` header value.
-8. Content script dispatches `mpp:payresponse` back to the page.
-9. Site retries its original request with the `Authorization` header.
+1. Site dispatches `mpp:payRequest` with invoice and challenge details.
+2. Content script forwards to the background service worker as `TIPT_402_PAY_REQUEST` with `source: 'mpp'`. The background derives the request host from `sender.url` (the browser-attested URL of the dispatching frame), never from the page-supplied `payload.url`, so a hostile page cannot impersonate a previously-allowlisted host. The content script also rate-limits `mpp:request` advertisements to once per **250 ms** per tab so a hostile page cannot spam the service worker awake by spinning `dispatchEvent`.
+3. Background decodes the BOLT11 invoice amount via `src/lib/bolt11.ts` (a minimal HRP regex; the full Spark SDK cannot run inside the MV3 service worker). The decoded amount is required for any auto-approval path — zero-amount or unparseable invoices always prompt. The HRP regex anchors the amount group to `(0|[1-9]\d*)` so non-canonical encodings like `lnbc0001m1…` are rejected up-front.
+4. Background calls `tryAutoApprove(host, amountSats)` (see *Allowlist*). When the host has caps that permit the payment, it atomically debits `spentToday` and proceeds without prompting.
+5. Otherwise, the background opens a dedicated **confirm popup window** (`confirm.html`) via `chrome.windows.create({ type: 'popup', width: 380, height: 540 })`. Pending request details — `{ host, url, method, invoice, amountSats, expiresAt }` — are written to `chrome.storage.session` under `tipt_pending_confirm_<id>` and the in-memory promise resolver is kept in a `Map<id, PendingConfirm>` keyed by `crypto.randomUUID()`. The created `window.id` is also tracked in `confirmWindowToId: Map<number, string>` so a `chrome.windows.onRemoved` listener can resolve the pending entry as *declined* the instant the user closes the popup with the [X] button (instead of waiting for the 5-minute alarm to free the host's confirm slot).
+6. The confirm popup renders `ConfirmApp` (`src/ConfirmApp.tsx`) and reads the request details directly from `chrome.storage.session` (no round-trip to the service worker is required). It displays host / amount / URL / invoice plus an "Auto-approve future payments from this site" checkbox. When checked, the popup shows two number inputs — *Max per payment* (defaults to the invoice amount) and *Max per day* (defaults to 2× the invoice amount, low enough that runaway approvals are bounded in single-digit transactions). Auto-approve is only offered when `amountSats` is known.
+7. The popup sends `TIPT_402_CONFIRM_RESPONSE` with `{ id, approved, remember, caps? }` and closes itself **only after** the message has been acknowledged. If `chrome.runtime.sendMessage` throws (e.g., the service worker was recycled between the user clicking Approve and the message dispatch) or the background returns `{ ok: false }`, `ConfirmApp` surfaces the error in the popup and keeps the window open so the user can retry rather than silently losing the approval and waiting for the 5-minute timeout. The background's onMessage handler restricts acceptance to messages whose `sender.url` starts with the extension's own `confirm.html`. The shared `PENDING_CONFIRM_PREFIX` / `pendingConfirmStorageKey(id)` / `PersistedConfirmDetails` definitions live in `src/lib/confirm-protocol.ts` so the popup and worker cannot drift on the storage key prefix or payload shape.
+8. If the user does not respond, the background **auto-declines after 5 minutes**. Expiry is enforced by `chrome.alarms` (`tipt-confirm-<id>`) so the timer survives service worker restarts. The alarm handler resolves any in-memory pending entry and removes the `tipt_pending_confirm_<id>` session-storage record.
+9. On approval, the background pays the invoice via the offscreen document and returns an `Authorization` header value. When `remember` is set and `amountSats > 0`, it persists the host + caps via `rememberHost(host, { maxSatsPerPayment, maxSatsPerDay, initialSpentSats: amountSats })`. The `Authorization` builder, JCS canonicaliser, base64url encoder, and opaque-decoder live in `src/lib/auth-credentials.ts` (separated from `background.ts` to keep the service-worker entry focused on orchestration).
+10. **All error strings returned to the page are first mapped to one of four opaque codes** — `'declined' | 'unavailable' | 'locked' | 'failed'` — via `sanitise402Error`. The site therefore learns success/failure plus a coarse category and cannot fingerprint internal wallet state (locked vs. uninitialised vs. SDK-specific error). Internal `[TIPT-BG]` logs still capture the full message for developer diagnostics.
+11. Content script dispatches `mpp:payResponse` back to the page.
+12. Site retries its original request with the `Authorization` header.
 
-> The previous design used `window.confirm()` inside the content script (via a `TIPT_PROMPT_402_PAYMENT` message). That path has been removed.
+> The previous design used `window.confirm()` inside the content script (via a `TIPT_PROMPT_402_PAYMENT` message). That path has been removed. The earlier `TIPT_402_CONFIRM_READY` round-trip used by the confirm popup to fetch its display details was also removed in favour of a direct `chrome.storage.session` read.
 
 ### Allowlist
-- Per-host auto-approval stored in `chrome.storage.local` under `tipt_402_allowlist` as `{ [host]: true }`.
-- Cache is invalidated via `chrome.storage.onChanged`.
+- Per-host auto-approval stored in `chrome.storage.local` under `tipt_402_allowlist`. Each entry has the shape:
+
+  ```ts
+  {
+    maxSatsPerPayment: number;  // single-invoice cap (sats)
+    maxSatsPerDay: number;      // rolling per-day cap (sats); 0 = unlimited per day
+    spentToday: number;         // running total for `dayKey`
+    dayKey: string;             // UTC date `YYYY-MM-DD`; running total resets when this changes
+    addedAt: number;            // epoch ms
+  }
+  ```
+
+- Legacy `Record<host, true>` entries from versions before per-host caps are silently dropped on first load. The user must re-grant explicit caps the next time a previously-allowlisted host requests payment.
+- `tryAutoApprove(host, amountSats)` enforces caps: it returns `{ approved: false }` whenever `amountSats` is unknown (e.g. zero-amount invoice), exceeds `maxSatsPerPayment`, or would push `spentToday + amountSats` over `maxSatsPerDay`. Otherwise it atomically updates `spentToday` and returns `{ approved: true }`.
+- The popup can list and revoke entries via `TIPT_402_ALLOWLIST_LIST` and `TIPT_402_ALLOWLIST_REMOVE` messages handled in the background. Both are gated to internal (extension-origin) senders.
+- All I/O is routed through `getItem`/`setItem` in `src/lib/storage.ts`, which gives the allowlist storage-layer memcache + hash-deduped sync writes for free. `allowlist.ts` keeps an additional module-level `cache: Allowlist | null` holding the *parsed* object so concurrent `tryAutoApprove` calls mutate the same reference — without this, two parallel parses would each see `spentToday = N`, both write `N + amt`, and silently lose one of the increments. A focused `chrome.storage.onChanged` listener (scoped to the single allowlist key) nulls the parsed cache when another extension context writes to it.
+- Persisting every `spentToday` increment is deliberate: MV3 service workers can be terminated at any moment, so deferring the write via a setTimeout/debounce could lose pending bumps and silently make the daily cap more permissive than the user authorised. `chrome.alarms` has 30 s minimum precision, too coarse to be useful here.
 
 ---
 
@@ -200,9 +221,9 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
 │  Wallet UI: setup, unlock,   │        │  Per-request 402 approval UI    │
 │  send, receive               │        └────────────────┬────────────────┘
 └──────┬─────────┬─────────────┘                         │
-       │         │ chrome.runtime.connect                │ TIPT_402_CONFIRM_READY
-       │         │ ('tipt-wallet' port)                  │ TIPT_402_CONFIRM_RESPONSE
-       │         │ + chrome.runtime.sendMessage          │
+       │         │ chrome.runtime.connect                │ TIPT_402_CONFIRM_RESPONSE
+       │         │ ('tipt-wallet' port)                  │ + chrome.storage.session
+       │         │ + chrome.runtime.sendMessage          │   (rehydrate request)
        │         │   (wallet ops)                        │
        │         │                                       ▼
        │    ┌────▼────────────────────────────┐  ┌───────────────────────┐
@@ -214,17 +235,17 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
        │    │  the offscreen lifetime; only   │  │  allowlist, badge,    │
        │    │  disposed on explicit reset.    │  │  confirm window mgmt  │
        │    └─────────────────────────────────┘  └────────┬──────────────┘
-       │                                                  │ chrome.tabs.sendMessage
-       │ chrome.storage.local / .session                  │
+       │                                                  │ chrome.windows.create
+       │ chrome.storage.local / .session                  │ (confirm popup)
        │ (single source of truth in src/lib/storage.ts)   │
        │                                          ┌───────▼────────┐
        │                                          │  Content Script│
        │                                          │  (content.ts)  │  CustomEvents (mpp:*)
        │                                          └───────┬────────┘
-       │                                                  │ mpp:announce  (TIPT → page)
-       │                                                  │ mpp:request   (page → TIPT)
-       │                                                  │ mpp:pay       (page → TIPT)
-       │                                                  │ mpp:payresponse (TIPT → page)
+       │                                                  │ mpp:response    (TIPT → page)
+       │                                                  │ mpp:request     (page → TIPT)
+       │                                                  │ mpp:payRequest  (page → TIPT)
+       │                                                  │ mpp:payResponse (TIPT → page)
        │                                                Page JS
        │
        └─── src/lib/ ─── storage, wallet-client (ensureOffscreen, sendWalletMessage,
@@ -248,6 +269,8 @@ The offscreen document (`offscreen.ts` + `wallet-service.ts`) is the **only** pl
 Before sending any wallet message the popup calls `ensureOffscreen()` (`src/lib/wallet-client.ts`), which calls `chrome.offscreen.createDocument` if the offscreen document does not already exist. The result is **memoized** after the first successful creation. All wallet messages are sent via `sendWalletMessage` (a thin `chrome.runtime.sendMessage` wrapper).
 
 The offscreen `chrome.runtime.onMessage` listener is structured as a single handler map (`handlers: Record<string, (payload) => Promise<Envelope>>`) instead of a long `if`-chain. Every handler returns either `{ ok: true, ... }` or `{ ok: false, error }`; thrown errors are caught and converted to the same `{ ok: false, error }` envelope.
+
+**Multi-listener dispatch hardening.** Both the background service worker and the offscreen document attach `chrome.runtime.onMessage` listeners to the same channel. To stop them from interfering on each other's traffic, each listener bails out (returns `undefined`) BEFORE running any sender validation when the incoming `msg.type` is not in its own handler map. This keeps a context completely out of the dispatch race for messages it doesn't own, so the sender's `await` reliably wires to the listener that actually responds rather than resolving to `undefined`. The popup-side allowlist screen (`TrustedSitesScreen.tsx`) also retries `chrome.runtime.sendMessage` once with a short delay if the first attempt resolves to `undefined`, as defense-in-depth against transient service-worker recycle races.
 
 | Message type | Payload | Response |
 |---|---|---|
@@ -293,44 +316,59 @@ Because the offscreen document cannot access `chrome.storage`, the background re
 
 ```
 src/
-├── App.tsx                 # Top-level wallet UI (~760 lines; was ~1320 pre-refactor)
-├── ConfirmApp.tsx          # 402 confirm popup React app
-├── background.ts           # MV3 service worker, 402 orchestration, confirm window mgmt
-├── confirm.tsx             # confirm.html entry point
+├── App.tsx                 # Top-level wallet UI (~770 lines; was ~1320 pre-refactor)
+├── ConfirmApp.tsx          # 402 confirm popup React app — reads `tipt_pending_confirm_<id>` directly
+├── background.ts           # MV3 service worker, 402 orchestration, allowlist caps, confirm window mgmt
+├── confirm.tsx             # confirm.html entry point (uses `bootstrap()`)
 ├── constants.ts            # Storage keys, PIN policy, PinAttemptsState interface
-├── content.ts              # MPP CustomEvent bridge (mpp:request / mpp:pay / mpp:payresponse)
+├── content.ts              # MPP CustomEvent bridge (mpp:request / mpp:payRequest / mpp:payResponse)
 ├── crypto.ts               # PBKDF2 (default 600k, legacy 100k) + AES-GCM helpers
 ├── lnurl.ts                # LNURL resolve + safe-URL guard (https only, no private hosts)
-├── main.tsx                # index.html entry point
+├── main.tsx                # index.html entry point (uses `bootstrap()`)
+├── main-bootstrap.tsx      # Shared React boot helper — gates StrictMode on import.meta.env.DEV
 ├── offscreen.ts            # Offscreen entry; handler map + wallet-event port
 ├── wallet-service.ts       # Sole SparkWallet owner; persists for offscreen lifetime, disposed via TIPT_DISPOSE_WALLET
 ├── components/
-│   ├── BackupPromptScreen.tsx
+│   ├── BackupPromptScreen.tsx     # Backup download UI with explicit plain-text warning
 │   ├── ErrorScreen.tsx
 │   ├── IdleScreen.tsx
 │   ├── InitializingScreen.tsx
 │   ├── LoadingScreen.tsx
 │   ├── PinInput.tsx
 │   ├── PinLockScreen.tsx
+│   ├── PinPromptModal.tsx         # Re-prompt overlay; gates Backup / Delete
 │   ├── PinSetupScreen.tsx
 │   ├── Spinner.tsx
+│   ├── TrustedSitesScreen.tsx     # Allowlist list + revoke UI
 │   └── ready/
 │       ├── ActionTabs.tsx
 │       ├── BalanceCard.tsx
-│       ├── ReadyHeader.tsx     # Owns its own settings-menu open/close state
+│       ├── ReadyHeader.tsx     # Settings menu (Backup / Trusted Sites / Delete)
 │       ├── ReadyScreen.tsx
 │       ├── ReceivePanel.tsx
 │       ├── SendPanel.tsx
 │       └── TransferList.tsx
 └── lib/
-    ├── fees.ts             # getMaxFeeSats, getMaxSpendableSats (algebraic)
-    ├── format.ts           # formatSats, formatUsd
-    ├── logger.ts           # log/warn gated by import.meta.env.DEV; error always on
-    ├── pin-attempts.ts     # PIN attempt tracking + lockout policy
-    ├── storage.ts          # getItem/setItem/removeItem + setItemDual/getSynced/removeItemDual for chrome.storage
-    ├── transfers.ts        # Transfer formatting/grouping helpers + WalletTransfer type
-    └── wallet-client.ts    # ensureOffscreen, sendWalletMessage, connectWalletPort
+    ├── allowlist.ts       # 402 allowlist with per-host caps; routes I/O through storage.ts + caches the parsed object
+    ├── auth-credentials.ts # JCS canonicaliser + base64url + opaque decoder + Authorization builder for 402 retries
+    ├── bolt11.ts          # Minimal HRP amount decoder used inside the MV3 service worker; rejects leading-zero amounts
+    ├── confirm-protocol.ts # Shared PENDING_CONFIRM_PREFIX + pendingConfirmStorageKey + PersistedConfirmDetails
+    ├── fees.ts            # getMaxFeeSats, getMaxSpendableSats (algebraic)
+    ├── format.ts          # formatSats, formatUsd
+    ├── http.ts            # safeJsonFetch — timeout, byte cap, redirect: 'error'
+    ├── key-store.ts       # IndexedDB-backed non-extractable AES key cache
+    ├── logger.ts          # log/warn gated by import.meta.env.DEV; error always on
+    ├── messages.ts        # MSG constant + Envelope<T>; single source of truth for runtime message strings
+    ├── migrate-legacy.ts  # scrubLegacyState — wipes pre-S7 plaintext PIN entry
+    ├── object-helpers.ts  # getStringField + nonEmptyString — safe property/value extraction from unknown payloads
+    ├── pin-attempts.ts    # PIN attempt tracking + lockout policy + verifyPin
+    ├── runtime.ts         # isInternalSender — shared MV3 sender check
+    ├── storage.ts         # getItem/setItem/... + in-memory cache + chrome.storage.onChanged invalidation + sync hash dedupe
+    ├── transfers.ts       # Transfer formatting/grouping helpers + WalletTransfer type
+    └── wallet-client.ts   # ensureOffscreen, sendWalletMessage, connectWalletPort
 ```
+
+`src/hooks/useBtcUsdRate.ts` — extracted hook owning the BTC/USD spot price (cache seed, mount-time freshness check, 5-minute refresh interval).
 
 ### Bundle layout (after `vite build`)
 
@@ -354,35 +392,64 @@ src/
 ## Security notes
 
 - **PBKDF2 600,000 iterations** for new PINs; legacy 100k blobs are detected and re-encrypted lazily on the next successful unlock.
-- **PIN attempt throttling** with 30 s / 5 min / 1 h lockouts at 5 / 10 / 15 failures.
+- **PIN attempt throttling** with 30 s / 5 min / 1 h lockouts at 5 / 10 / 15 failures. The throttle is shared by the unlock screen and the `PinPromptModal` re-auth flow, so an attacker cannot bypass it by attacking the backup / delete prompts.
+- **PIN re-prompt for sensitive actions** — Back-up-mnemonic and Delete-wallet both require a fresh PIN entry through `PinPromptModal`, even when the wallet is already unlocked. This defeats brief-physical-access attacks where an attacker would otherwise be able to exfiltrate the recovery phrase or wipe the wallet from a cached session.
+- **Backup file warning** — the backup screen states explicitly that the downloaded file is plain text and grants full spending authority, to deter users from sending it through chat / email / cloud sync.
 - **LNURL safe-URL guard** applies to both the initial LNURL endpoint and the server-returned `callback`. https-only; no loopback / private / link-local / multicast / `.onion`.
+- **Safe HTTP fetches** — every outbound HTTP call to an untrusted endpoint (LNURL servers, CoinGecko) goes through `safeJsonFetch` (`src/lib/http.ts`), which enforces an `AbortController` timeout, streams the body with a byte cap, validates `Content-Length` when present, and sets `redirect: 'error'` so a hostile server cannot transparently send TIPT through a redirect into a private host.
+- **402 host attestation** — the background derives the 402 request host from `sender.url` (the browser-attested URL of the dispatching frame), not from the page-supplied `payload.url`. A malicious page therefore cannot impersonate an already-allowlisted host.
+- **One-confirm-per-host queueing** — `background.ts` keeps a `Set<host>` of hosts with an in-flight confirm popup and rejects further 402 requests from the same host until the user responds (or the 5 min alarm expires). A malicious page therefore cannot DoS the user with a stack of confirm windows.
+- **Per-host caps with daily reset** — `tryAutoApprove` requires a successfully-decoded invoice amount and enforces `maxSatsPerPayment` plus a UTC-day `maxSatsPerDay` cap, with the running counter persisted to `chrome.storage.local`. Zero-amount or unparseable invoices always prompt.
+- **Confirm popup sender check** — `TIPT_402_CONFIRM_RESPONSE` is only accepted when the sender URL starts with the extension's own `confirm.html`, so a content script that happens to share the same extension origin cannot spoof user approvals.
+- **JCS hardened** — the RFC 8785 canonicaliser throws on non-finite numbers, `Symbol` / function values, and other unsupported types instead of silently emitting `null`, so a hostile server cannot trick TIPT into signing a payment credential that the upstream service then validates differently.
+- **Opaque payload validation** — the optional `paymentChallenge.opaque` field is base64url-decoded and parsed as JSON, then validated as a flat `Record<string, string>` with each value ≤1024 chars. Nested objects, arrays, numbers, or oversize strings are rejected — preventing a hostile server from injecting structure into the JCS-signed credential TIPT echoes back.
+- **Page-input length caps** — the content script (`src/content.ts`) rejects `mpp:payRequest` payloads with bolt11 invoices > 8192 chars, request IDs > 256 chars, opaque blobs > 4096 chars, or any short field (realm, method, intent) > 512 chars. The `bolt11.decodeBolt11AmountSats` helper enforces the same 8192-char cap and a 19-digit amount cap on every decode path.
+- **Manifest-permission minimisation** — `tabs` was removed; `host_permissions` was narrowed from `<all_urls>` to `https://*/*`; content scripts run on `https://*/*` plus `http://localhost/*` and `http://127.0.0.1/*` for local demo testing only (production traffic still requires HTTPS — only the content-script injection match expands).
 - **Wallet secrets in both `chrome.storage.local` and `chrome.storage.sync`** via `setItemDual`. Local is the primary read path (fast); sync exists so a user signed into the same Chrome profile on another device automatically picks up their encrypted wallet. The PIN is required on every device to decrypt — sync only transports the ciphertext.
 - **Mnemonic not retained in React state** after the app reaches `ready`. The backup-download flow re-derives the mnemonic on demand using the cached `CryptoKey`.
 - **Confirm popup window** replaces the page-level `window.confirm`, so a hostile page cannot suppress, race, or visually spoof the dialog.
 - **PIN-derived AES-GCM key cached in shared IndexedDB** (`src/lib/key-store.ts`) as a **non-extractable** `CryptoKey`. The raw PIN is never persisted — the previous `chrome.storage.session` entry that held it in plaintext has been removed. Background, popup, and offscreen contexts share the same extension-origin IDB and read the key directly to decrypt the wallet on 402 challenges without user interaction. `chrome.runtime.onStartup` clears the IDB entry on every browser launch, so the key's lifetime still matches a single browser session.
+- **AES-GCM ciphertext encoded as base64** for new writes (was hex); the decoder accepts either format so existing installs continue to read pre-migration blobs. Base64 is ~33 % smaller than hex, giving meaningful headroom under the `chrome.storage.sync` 8 KB per-item quota.
+- **CSP `connect-src` restricted** — the extension's CSP whitelists `'self' https:` for `connect-src`, `'self' data:` for `img-src`, and `'self' 'unsafe-inline'` for `style-src`. `wss:` was dropped because nothing in the bundled code (Spark SDK, hooks, components) opens a WebSocket — verified by grepping the built `offscreen.js` for `new WebSocket(`. `https:` is retained because LNURL pay is an open protocol whose `callback` field can point to any HTTPS host operated by the recipient's wallet — narrowing to a fixed allowlist would break payments to arbitrary Lightning Addresses.
+- **Storage sync-hash integrity** — `setItem` stamps the SHA-256 dedupe hash **after** the `chrome.storage.sync.set` await resolves, not before. A quota / offline failure no longer poisons the dedupe map with a hash that doesn't reflect on-disk state. Likewise, the `chrome.storage.onChanged` listener always *clears* the stale `lastSyncHash[key]` entry on any external sync change — the other context wrote a value we didn't compute the hash for, so the only correct local state is "unknown."
+- **Confirm popup window-close = decline** — closing the confirm popup with the [X] button used to leave the host in the `hostsWithPendingConfirm` set until the 5-minute alarm fired (UX wedge + low-grade DoS on the user's own browsing). A `chrome.windows.onRemoved` listener now resolves the pending entry as declined the instant the window is closed.
+- **ConfirmApp respond() surfaces errors** — `chrome.runtime.sendMessage` failures (e.g., service worker recycled mid-click) used to be swallowed by `finally { window.close() }`, leaving the user thinking they had approved while the awaiting tab silently timed out at 5 minutes. The popup now keeps itself open and shows the error so the user can retry.
+- **`mpp:request` rate limiting** — the content script throttles `mpp:request` advertisements to once per 250 ms per tab, so a hostile page can't spam the service worker awake with a `dispatchEvent` loop.
+- **Sanitised 402 error responses** — every error string returned from `handle402PaymentRequest` is mapped at the background→content boundary to one of four opaque codes (`'declined' | 'unavailable' | 'locked' | 'failed'`) by `sanitise402Error`. A site can no longer fingerprint internal wallet state ("Wallet is locked", "Wallet data not found", SDK internals) from the `mpp:payResponse` event. Internal logs keep the full message.
+- **Background-side 402 payload revalidation** — `validate402Payload` re-applies the same length / type / required-field caps that `src/content.ts` enforces at the page boundary (invoice ≤ 8192, short fields ≤ 512, opaque ≤ 4096, etc.) before anything is fed into the JCS canonicaliser, BOLT11 decoder, or the SDK. A future regression in the content script — or a direct internal sender bypass — therefore can't push unbounded strings through the worker.
+- **LNURL trailing-dot normalisation** — `isDisallowedHost` strips a trailing FQDN dot before its `.local` / `.onion` suffix checks, so a hostile LNURL of `https://service.onion./…` (or `https://printer.local./…`) can no longer slip past the private-network guard.
 
 ---
 
 ## Performance notes
 
 - **Offscreen creation memoized** — `ensureOffscreen()` short-circuits after first success.
-- **BTC price refresh aborts** in-flight requests on effect cleanup via `AbortController`.
-- **`loadTransfers` debounced 500 ms** on balance changes.
+- **BTC price refresh aborts** in-flight requests on effect cleanup via `AbortController`. The initial fetch is skipped when the persisted cache is < 60 s old, removing one HTTP round-trip from most popup opens.
+- **`loadTransfers` debounced 1500 ms** on balance changes; the longer window collapses the burst of `transfer:claimed` + `deposit:confirmed` + post-send `getBalance` events into one `getTransfers` round-trip per real-world payment.
+- **`pollForPreimage` initial poll at 200 ms**, then exponential backoff to 5 s — captures sub-second Lightning settlements without polling aggressively for long-routing payments.
+- **In-memory storage cache** — `src/lib/storage.ts` caches every read in a `Map<string, string|null>` and invalidates via `chrome.storage.onChanged`. Popup-open flows that touch the same key 5+ times (e.g. `getSynced(WALLET_KEY)`) now hit the disk once.
+- **Hash-deduped sync writes** — identical `chrome.storage.sync.set` calls are SHA-256-deduped and skipped, so chronic re-writes (e.g. allowlist `loadAllowlist` save-on-noop) don't burn through the 120-write-per-minute quota.
+- **`safeJsonFetch` fast path** — responses with `Content-Length ≤ 1024` skip the stream-reader plumbing and just await `.text()`. Useful for the ~150-byte CoinGecko price response. The byte-cap check also short-circuits on `text.length > maxBytes` (UTF-16 code units are always ≤ UTF-8 byte length), avoiding a `TextEncoder().encode()` allocation when the body is obviously too big.
+- **Parallel popup-mount reads** — `App.tsx` issues `getSynced(WALLET_KEY)` and `loadUnlockKey()` in a `Promise.all` on mount, shaving one IndexedDB / `chrome.storage` round-trip off every popup open.
+- **Single Authorization-credential helper module** — `src/lib/auth-credentials.ts` factors the JCS canonicaliser, base64url-utf8 encoder, opaque decoder, and `buildAuthorizationValue` out of `background.ts`. The service worker entry shrinks by ~110 lines and the helpers are independently testable.
 - **`getMaxSpendableSats` algebraic** — closed-form solution; no general-purpose loop.
 - **`chrome.storage` is the single source of truth** — no `localStorage` write-through layer.
 - **Spark SDK isolated to offscreen** — popup bundle stays small.
+- **SDK payload serialisation contract** — `getWalletTransfers` runs SDK responses through `normaliseBigints`, which converts `bigint` → decimal string, `Date` → ISO string, `Map`/`Set` → object/array, and passes typed arrays through untouched. Without the `Date` branch every transfer's timestamp would round-trip to `{}` (because `Object.entries(date)` returns `[]`) and the popup would render "Unknown date" for every row.
+- **`mpp:request` handler keeps the SW alive until `setIcon` resolves** — the background MPP_REQUEST_TRIGGERED handler returns `true` and calls `sendResponse({ok:true})` in a `.finally`. Without this, Chrome may unload the service worker mid-`await` and silently drop the icon swap when the worker had just spun up to handle this one message. The content script's `chrome.runtime.sendMessage` is wrapped in `.catch(() => {})` to suppress the unhandled-promise warning that fires on host pages when the SW is genuinely unreachable.
 
 ---
 
 ## Manifest
 
 - **Manifest version**: 3
-- **Permissions**: `tabs`, `storage`, `offscreen`
-- **Host permissions**: `<all_urls>`
-- **Content script**: `content.js` injected at `document_start` on all URLs
+- **Permissions**: `storage`, `offscreen`, `alarms`
+- **Host permissions**: `https://*/*` (narrowed from `<all_urls>` so the extension can never run cross-origin requests against `http://`, `file://`, or `chrome-extension://` targets)
+- **Content script**: `content.js` injected at `document_start` on `https://*/*`, plus `http://localhost/*` and `http://127.0.0.1/*` so the bundled `demo.html` is testable via a local dev server (e.g. `vite preview`). 402 payments on the production web still require HTTPS endpoints; the loopback origins are a developer convenience only.
 - **Background**: `background.js` module service worker
-- **CSP**: `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'` (WASM eval required for the Spark SDK in the offscreen document)
+- **CSP**: `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https:; img-src 'self' data:; style-src 'self' 'unsafe-inline'`. WASM eval is required for the Spark SDK in the offscreen document; `wss:` was dropped from `connect-src` after a grep of the built `offscreen.js` confirmed nothing in the bundle uses `new WebSocket(`. LNURL pay requires arbitrary HTTPS reach so `https:` is retained.
 - **Extension pages**: `index.html` (popup, default action), `offscreen.html` (offscreen document), `confirm.html` (per-request 402 approval popup window)
+- The `tabs` permission was removed when the 402 flow stopped using `chrome.tabs.sendMessage` (responses are now delivered via the per-request popup window). The `alarms` permission was added to enforce confirm-popup expiry across service-worker restarts.
 
 ---
 
@@ -393,10 +460,11 @@ src/
 | `spark_pin` | `chrome.storage.local` + `chrome.storage.sync` | `{ salt, iterations, verifier: { iv, ct } }`. Written via `setItemDual` (both areas). Reads via `getSynced` (local first, sync fallback). |
 | `spark_wallet` | `chrome.storage.local` + `chrome.storage.sync` | Encrypted BIP-39 mnemonic: `{ iv, ct }`. Written via `setItemDual` (both areas). Reads via `getSynced` (local first, sync fallback). |
 | `tipt_unlock_key` (IndexedDB) | shared `IDBDatabase` at extension origin | Non-extractable PBKDF2/AES-GCM `CryptoKey`. Stored via `src/lib/key-store.ts`. Cleared on `chrome.runtime.onStartup`, so its lifetime mirrors the previous `chrome.storage.session` PIN entry — but the raw PIN is never persisted. |
-| `spark_btc_usd_rate` | `chrome.storage.local` | `{ rate: number, fetchedAt: number }` cached BTC→USD spot for the equivalent display. Refreshed every 5 minutes. |
+| `spark_btc_usd_rate` | `chrome.storage.local` | `{ rate: number, ts: number }` cached BTC→USD spot for the equivalent display. Refreshed every 5 minutes; the initial-mount refresh is skipped when the cached value is younger than 60 s. |
 | `spark_transfers_cache` | `chrome.storage.local` | AES-GCM-encrypted JSON of the 10 most recent transfers, keyed by the PIN-derived `CryptoKey`. |
 | `spark_pin_attempts` | `chrome.storage.local` | `{ count, lockedUntil }` for PIN unlock throttling. |
-| `tipt_402_allowlist` | `chrome.storage.local` | `{ [host]: true }` auto-approve map for the 402 confirm flow. |
+| `tipt_402_allowlist` | `chrome.storage.local` | Per-host auto-approve entries `{ [host]: { maxSatsPerPayment, maxSatsPerDay, spentToday, dayKey, addedAt } }`. Legacy `host: true` entries are dropped on load. |
+| `tipt_pending_confirm_<id>` | `chrome.storage.session` | Per-pending-confirm display payload `{ host, url, method, invoice, amountSats, expiresAt }` used by the confirm popup to rehydrate without re-querying the service worker. Cleared on user response, on the matching `chrome.alarms` expiry, or when the session ends. |
 
 All storage access goes through `src/lib/storage.ts` (`getItem` / `setItem` / `removeItem` / `getWithMigration`); there is no `localStorage` write-through.
 

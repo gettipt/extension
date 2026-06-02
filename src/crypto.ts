@@ -16,6 +16,37 @@ export function bufToHex(buf: Uint8Array): string {
     .join('');
 }
 
+// Encode raw bytes to standard base64. Used to write new ciphertext entries
+// into chrome.storage.sync, where the 8 KB per-item quota makes the ~33%
+// space saving over hex significant for larger encrypted blobs (e.g. the
+// recent-transfers cache).
+export function bufToB64(buf: Uint8Array): string {
+  // String.fromCharCode(...buf) blows the call stack on large inputs; build
+  // the binary string in chunks instead.
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < buf.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, Array.from(buf.subarray(i, i + CHUNK)));
+  }
+  return btoa(bin);
+}
+
+export function b64ToBuf(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Dual-decoder used everywhere we read previously-written ciphertext. The
+// old format was lowercase hex; the new format is standard base64. Callers
+// don't care which one is on disk — we sniff: if every char is a hex digit
+// AND the length is even, treat it as hex; otherwise try base64.
+function decodeIvOrCt(value: string): Uint8Array {
+  if (value.length % 2 === 0 && /^[0-9a-f]+$/i.test(value)) return hexToBuf(value);
+  return b64ToBuf(value);
+}
+
 export async function deriveKey(
   pin: string,
   salt: Uint8Array,
@@ -48,7 +79,9 @@ export async function encryptText(
     key,
     new TextEncoder().encode(text),
   );
-  return { iv: bufToHex(iv), ct: bufToHex(new Uint8Array(ct)) };
+  // New writes use base64 — smaller payload, fits the sync quota with more
+  // headroom. Reads (decryptText) accept either format for back-compat.
+  return { iv: bufToB64(iv), ct: bufToB64(new Uint8Array(ct)) };
 }
 
 export async function decryptText(
@@ -57,9 +90,9 @@ export async function decryptText(
   ct: string,
 ): Promise<string> {
   const plain = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: hexToBuf(iv).buffer as ArrayBuffer },
+    { name: 'AES-GCM', iv: decodeIvOrCt(iv).buffer as ArrayBuffer },
     key,
-    hexToBuf(ct).buffer as ArrayBuffer,
+    decodeIvOrCt(ct).buffer as ArrayBuffer,
   );
   return new TextDecoder().decode(plain);
 }
@@ -68,3 +101,4 @@ export async function decryptText(
 export async function generateSessionKey(): Promise<CryptoKey> {
   return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
+

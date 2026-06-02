@@ -4,9 +4,10 @@ import { FaGear } from 'react-icons/fa6';
 interface ReadyHeaderProps {
   onBackup: () => void;
   onDelete: () => void;
+  onTrustedSites: () => void;
 }
 
-export function ReadyHeader({ onBackup, onDelete }: ReadyHeaderProps) {
+export function ReadyHeader({ onBackup, onDelete, onTrustedSites }: ReadyHeaderProps) {
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const settingsMenuRef = useRef<HTMLDivElement>(null);
 
@@ -48,6 +49,15 @@ export function ReadyHeader({ onBackup, onDelete }: ReadyHeaderProps) {
                   className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
                 >
                   Backup Wallet
+                </button>
+                <button
+                  onClick={() => {
+                    onTrustedSites();
+                    setShowSettingsMenu(false);
+                  }}
+                  className="text-xs text-neutral-700 hover:text-neutral-900 dark:text-neutral-300 dark:hover:text-white"
+                >
+                  Trusted Sites
                 </button>
                 <button
                   onClick={() => {
