@@ -1,5 +1,5 @@
 /// <reference types="chrome" />
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { MSG } from './lib/messages';
 import {
   pendingConfirmStorageKey,
@@ -21,18 +21,83 @@ function formatSats(value: number | null): string {
   return `${value.toLocaleString('en-US')} sats`;
 }
 
+// Resize the confirm popup's chrome window so its inner content area
+// exactly matches the rendered DOM — no vertical or horizontal scroll.
+// Anchors the right edge so the popup stays glued to the top-right
+// corner that background.ts initially positioned it at, even as the
+// remember-caps field opens/closes and the height changes.
+function useAutoResizeWindow(rootRef: React.RefObject<HTMLElement | null>): void {
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let cancelled = false;
+    let windowId: number | null = null;
+    let pendingFrame: number | null = null;
+    let lastWidth = -1;
+    let lastHeight = -1;
+
+    chrome.windows.getCurrent().then((win) => {
+      if (cancelled) return;
+      windowId = typeof win?.id === 'number' ? win.id : null;
+    }).catch(() => { /* best-effort */ });
+
+    const resize = () => {
+      pendingFrame = null;
+      if (windowId === null || !root) return;
+      const contentWidth = root.offsetWidth;
+      const contentHeight = root.offsetHeight;
+      if (contentWidth === lastWidth && contentHeight === lastHeight) return;
+      lastWidth = contentWidth;
+      lastHeight = contentHeight;
+      // Chrome reports outer/inner for the whole window; the delta is the
+      // OS window decorations (title bar + borders). We add that delta to
+      // the rendered content size to compute the outer window size that
+      // produces an inner area equal to the content.
+      const chromeW = Math.max(0, window.outerWidth - window.innerWidth);
+      const chromeH = Math.max(0, window.outerHeight - window.innerHeight);
+      const newOuterWidth = contentWidth + chromeW;
+      const newOuterHeight = contentHeight + chromeH;
+      const currentRight = window.screenX + window.outerWidth;
+      const newLeft = Math.round(currentRight - newOuterWidth);
+      chrome.windows.update(windowId, {
+        width: newOuterWidth,
+        height: newOuterHeight,
+        left: newLeft,
+      }).catch(() => { /* best-effort */ });
+    };
+
+    const schedule = () => {
+      if (pendingFrame !== null) return;
+      pendingFrame = requestAnimationFrame(resize);
+    };
+
+    const observer = new ResizeObserver(schedule);
+    observer.observe(root);
+    schedule();
+
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+      if (pendingFrame !== null) cancelAnimationFrame(pendingFrame);
+    };
+  }, [rootRef]);
+}
+
 export default function ConfirmApp() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const id = params.get('id') ?? '';
   const [details, setDetails] = useState<PersistedConfirmDetails | null>(null);
   const [remember, setRemember] = useState(false);
-  const [perPaymentCap, setPerPaymentCap] = useState('');
   const [perDayCap, setPerDayCap] = useState('');
   // Initialise error from `id` rather than setting it from inside the effect
   // — that's a cascading-render anti-pattern. `id` is derived from
   // location.search once at mount, so the initial value never changes.
   const [error, setError] = useState<string | null>(id ? null : 'Missing request id.');
   const [busy, setBusy] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useAutoResizeWindow(rootRef);
 
   useEffect(() => {
     if (!id) return;
@@ -49,10 +114,10 @@ export default function ConfirmApp() {
         }
         setDetails(raw);
         if (typeof raw.amountSats === 'number' && raw.amountSats > 0) {
-          setPerPaymentCap(String(raw.amountSats));
-          // Conservative default: daily cap = 2x per-payment. Old default
-          // was 10x, which gave a single invoice unintended cumulative
-          // authority. Users can still raise it before approving.
+          // Conservative default: daily cap = 2x current invoice. Old
+          // default was 10x, which gave a single invoice unintended
+          // cumulative authority. Users can still raise it before
+          // approving.
           setPerDayCap(String(raw.amountSats * 2));
         }
       } catch (err) {
@@ -75,29 +140,21 @@ export default function ConfirmApp() {
         remember: approved && remember && canRemember,
       };
       if (approved && remember && canRemember) {
-        const perPayment = parseInt(perPaymentCap, 10);
         const perDay = parseInt(perDayCap, 10);
-        if (!Number.isFinite(perPayment) || perPayment <= 0) {
-          setError('Per-payment cap must be a positive number.');
-          setBusy(false);
-          return;
-        }
         if (!Number.isFinite(perDay) || perDay <= 0) {
           setError('Daily cap must be a positive number.');
           setBusy(false);
           return;
         }
-        if (perDay < perPayment) {
-          setError('Daily cap must be greater than or equal to the per-payment cap.');
+        if (details && details.amountSats !== null && perDay < details.amountSats) {
+          setError('Daily cap must cover this invoice.');
           setBusy(false);
           return;
         }
-        if (details && details.amountSats !== null && perPayment < details.amountSats) {
-          setError('Per-payment cap must cover this invoice.');
-          setBusy(false);
-          return;
-        }
-        payload.caps = { maxSatsPerPayment: perPayment, maxSatsPerDay: perDay };
+        // Only one cap is collected from the user (daily). Map it to both
+        // sides of the allowlist API so the per-payment limit is the same
+        // as the daily limit — i.e. the daily cap is the sole constraint.
+        payload.caps = { maxSatsPerPayment: perDay, maxSatsPerDay: perDay };
       }
       // Do NOT swallow sendMessage failures and close the window anyway —
       // the awaiting tab would observe a silent timeout (up to 5 min) while
@@ -126,12 +183,10 @@ export default function ConfirmApp() {
   };
 
   return (
-    <div className="w-full h-screen bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100 p-5 flex flex-col gap-4">
-      <div className="flex items-center gap-2">
-        <img src="/tiptgreen.svg" alt="TIPT" className="w-7 h-7" />
-        <h1 className="text-base font-semibold">Approve Payment</h1>
-      </div>
-
+    <div
+      ref={rootRef}
+      className="w-[360px] bg-white text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100 p-5 flex flex-col gap-4"
+    >
       {error && (
         <div className="p-3 rounded-xl border border-red-300 bg-red-50 text-red-800 text-xs dark:bg-red-950/40 dark:border-red-900 dark:text-red-300">
           {error}
@@ -149,14 +204,6 @@ export default function ConfirmApp() {
               <div className="text-neutral-500 dark:text-neutral-400">Amount</div>
               <div className="font-mono">{formatSats(details.amountSats)}</div>
             </div>
-            <div>
-              <div className="text-neutral-500 dark:text-neutral-400">Request</div>
-              <div className="font-mono break-all">{details.method} {details.url}</div>
-            </div>
-            <div>
-              <div className="text-neutral-500 dark:text-neutral-400">Invoice</div>
-              <div className="font-mono break-all">{details.invoice.slice(0, 80)}{details.invoice.length > 80 ? '…' : ''}</div>
-            </div>
           </div>
 
           <label className={`flex items-center gap-2 text-xs ${canRemember ? 'text-neutral-700 dark:text-neutral-300' : 'text-neutral-400 dark:text-neutral-600'}`}>
@@ -167,32 +214,20 @@ export default function ConfirmApp() {
               onChange={(e) => setRemember(e.target.checked)}
               className="w-4 h-4 accent-neutral-900 dark:accent-neutral-200 disabled:opacity-40"
             />
-            Auto-approve future payments from this site, up to the caps below
+            Auto-approve future payments from this site, up to the daily cap below
           </label>
 
           {remember && canRemember && (
-            <div className="space-y-2 text-xs">
-              <label className="block">
-                <span className="text-neutral-500 dark:text-neutral-400">Max per payment (sats)</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  value={perPaymentCap}
-                  onChange={(e) => setPerPaymentCap(sanitiseSatsInput(e.target.value))}
-                  className="mt-1 w-full px-2 py-1.5 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 font-mono text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-neutral-500"
-                />
-              </label>
-              <label className="block">
-                <span className="text-neutral-500 dark:text-neutral-400">Max per day (sats)</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  value={perDayCap}
-                  onChange={(e) => setPerDayCap(sanitiseSatsInput(e.target.value))}
-                  className="mt-1 w-full px-2 py-1.5 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 font-mono text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-neutral-500"
-                />
-              </label>
-            </div>
+            <label className="block text-xs">
+              <span className="text-neutral-500 dark:text-neutral-400">Max per day (sats)</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={perDayCap}
+                onChange={(e) => setPerDayCap(sanitiseSatsInput(e.target.value))}
+                className="mt-1 w-full px-2 py-1.5 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 font-mono text-neutral-900 dark:text-neutral-100 focus:outline-none focus:border-neutral-500"
+              />
+            </label>
           )}
 
           {!canRemember && (
@@ -200,8 +235,6 @@ export default function ConfirmApp() {
               Auto-approve is only available for invoices with a known amount.
             </p>
           )}
-
-          <div className="flex-1" />
 
           <div className="flex gap-2">
             <button

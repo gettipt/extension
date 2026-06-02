@@ -13,14 +13,17 @@ body {
   width: 324px;
 }
 
+/* Confirm popup window (confirm.html) sizes itself to its content via
+   chrome.windows.update, so the body must not be locked to the main
+   popup's 324px width. */
+body:has(#confirm-root),
+html:has(#confirm-root) {
+  width: auto;
+}
+
 @media (prefers-color-scheme: dark) {
   html,
   body {
     color: #fafafa;
   }
 }
-
-/* #root {
-  width: 360px;
-  min-height: 400px;
-} */

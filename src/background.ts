@@ -32,6 +32,50 @@ const GREEN_ICON = 'greenasterisk.png';
 const ALARM_PREFIX = 'tipt-confirm-';
 const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
 
+// Initial confirm popup geometry. Anchored to the top-right of the user's
+// currently focused browser window so the prompt appears in the same place
+// that extensions like Honey and Rakuten use for their in-page toasts,
+// rather than wherever Chrome decides to place an unpositioned popup
+// window. Width and height are only the *initial* size — `ConfirmApp`
+// resizes the window to fit its rendered content as soon as it mounts
+// (see `useAutoResizeWindow` in src/ConfirmApp.tsx) so there is never
+// a vertical or horizontal scrollbar.
+const CONFIRM_POPUP_WIDTH = 380;
+const CONFIRM_POPUP_HEIGHT = 320;
+const CONFIRM_POPUP_MARGIN = 16;
+
+async function getConfirmPopupTopRight(): Promise<{ left: number; top: number } | null> {
+  // chrome.windows.getLastFocused returns the most recently focused window
+  // — which is the user's normal browser window where the 402 request just
+  // fired. Filtering to type 'normal' avoids anchoring to a previously-open
+  // TIPT confirm popup (which is itself a 'popup'-type window).
+  try {
+    const focused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+    if (
+      !focused ||
+      typeof focused.left !== 'number' ||
+      typeof focused.top !== 'number' ||
+      typeof focused.width !== 'number'
+    ) {
+      return null;
+    }
+    const rightEdge = focused.left + focused.width;
+    // Don't push the popup off the left edge of the host window on very
+    // narrow browser windows — fall back to the window's left margin.
+    const left = Math.max(
+      Math.round(focused.left + CONFIRM_POPUP_MARGIN),
+      Math.round(rightEdge - CONFIRM_POPUP_WIDTH - CONFIRM_POPUP_MARGIN),
+    );
+    const top = Math.round(focused.top + CONFIRM_POPUP_MARGIN);
+    return { left, top };
+  } catch {
+    // Best-effort positioning. If the API call fails for any reason we let
+    // Chrome place the popup wherever it likes rather than blocking the
+    // approval flow.
+    return null;
+  }
+}
+
 // Defensive caps duplicated from content.ts. The content-script boundary
 // applies these on the way in, but a future regression there (or a direct
 // internal sender invoking PAY_REQUEST_402) must not be able to bypass them.
@@ -245,12 +289,14 @@ function promptForPaymentApproval(
       try {
         await persistConfirmDetails(id, details);
         await chrome.alarms.create(`${ALARM_PREFIX}${id}`, { when: expiresAt });
+        const coords = await getConfirmPopupTopRight();
         const win = await chrome.windows.create({
           url: chrome.runtime.getURL(`confirm.html?id=${encodeURIComponent(id)}`),
           type: 'popup',
-          width: 380,
-          height: 540,
+          width: CONFIRM_POPUP_WIDTH,
+          height: CONFIRM_POPUP_HEIGHT,
           focused: true,
+          ...(coords ?? {}),
         });
         if (typeof win?.id === 'number') {
           confirmWindowToId.set(win.id, id);
