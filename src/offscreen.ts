@@ -1,29 +1,36 @@
 /// <reference types="chrome" />
 import {
-  payInvoiceFromSession,
   initWalletFromMnemonic,
   getWalletBalance,
   getWalletTransfers,
   createWalletInvoice,
   getWalletFeeEstimate,
-  payWalletInvoice,
+  payInvoice,
   hasCachedWallet,
-  disposeCachedWallet,
-  ensureWalletForSession,
+  disposeWallet,
   registerWalletEventListener,
 } from './wallet-service';
+import { clearUnlockKey } from './lib/key-store';
 
 type Envelope = { ok: true; [key: string]: unknown } | { ok: false; error: string };
+
+// Defense in depth: drop any message whose sender doesn't claim our own
+// extension id. `chrome.runtime.onMessage` is, by design, internal-only
+// (it never delivers external messages unless `externally_connectable` is
+// set, which we don't set), but enforcing the invariant makes the contract
+// explicit and future-proofs us against config drift.
+function isInternalSender(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id;
+}
 
 const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Envelope>> = {
   async TIPT_OFFSCREEN_PAY_INVOICE(p) {
     const invoice = p.invoice as string | undefined;
-    const sessionPin = p.sessionPin as string | undefined;
-    const pinRaw = p.pinRaw as string | undefined;
     const walletRaw = p.walletRaw as string | undefined;
     if (!invoice) return { ok: false, error: 'Missing invoice for offscreen payment.' };
-    if (!sessionPin || !pinRaw || !walletRaw) return { ok: false, error: 'Missing wallet credentials for offscreen payment.' };
-    const r = await payInvoiceFromSession(invoice, sessionPin, pinRaw, walletRaw);
+    if (!walletRaw) return { ok: false, error: 'Missing wallet ciphertext for offscreen payment.' };
+    const r = await payInvoice(invoice, { walletRaw, pollPreimage: true });
+    if (!r.preimage) return { ok: false, error: 'Payment succeeded but preimage was not available.' };
     return { ok: true, preimage: r.preimage };
   },
   async TIPT_WALLET_CREATE(p) {
@@ -54,33 +61,24 @@ const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Env
   },
   async TIPT_PAY_INVOICE(p) {
     const invoice = p.invoice as string | undefined;
-    const maxFeeSats = typeof p.maxFeeSats === 'number' ? p.maxFeeSats : 50;
     if (!invoice) return { ok: false, error: 'Missing invoice.' };
-    // Auto-recover the wallet if it was torn down (e.g. offscreen restart).
-    const sessionPin = p.sessionPin as string | undefined;
-    const pinRaw = p.pinRaw as string | undefined;
+    const maxFeeSats = typeof p.maxFeeSats === 'number' ? p.maxFeeSats : undefined;
     const walletRaw = p.walletRaw as string | undefined;
-    const cached = await hasCachedWallet();
-    if (!cached.hasWallet) {
-      if (!sessionPin || !pinRaw || !walletRaw) {
-        return { ok: false, error: 'Wallet not initialized and no credentials provided to re-initialize.' };
-      }
-      await ensureWalletForSession(sessionPin, pinRaw, walletRaw);
-    }
-    const r = await payWalletInvoice(invoice, maxFeeSats);
+    const r = await payInvoice(invoice, { maxFeeSats, walletRaw });
     return { ok: true, txId: r.txId };
   },
   async TIPT_HAS_WALLET() {
-    const r = await hasCachedWallet();
-    return { ok: true, hasWallet: r.hasWallet, balanceSats: r.balanceSats?.toString() };
+    return { ok: true, hasWallet: hasCachedWallet() };
   },
   async TIPT_DISPOSE_WALLET() {
-    await disposeCachedWallet();
+    await disposeWallet();
+    await clearUnlockKey();
     return { ok: true };
   },
 };
 
-chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+  if (!isInternalSender(sender)) return;
   const msg = message as { type?: string; payload?: Record<string, unknown> };
   const type = msg?.type;
   if (!type) return;
@@ -99,6 +97,7 @@ chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) =
 
 // Long-lived port for wallet events. Popup connects with name 'tipt-wallet'.
 chrome.runtime.onConnect.addListener((port) => {
+  if (port.sender?.id !== chrome.runtime.id) return;
   if (port.name !== 'tipt-wallet') return;
   const unsubscribe = registerWalletEventListener((event, balance) => {
     try {

@@ -1,14 +1,23 @@
+import { Suspense, lazy } from 'react';
 import type { LnurlPayInfo } from '../../lnurl';
 import type { WalletTransfer } from '../../lib/transfers';
+import type { SendStep } from '../../lib/send-types';
 import { ReadyHeader } from './ReadyHeader';
 import { BalanceCard } from './BalanceCard';
 import { ActionTabs } from './ActionTabs';
 import { TransferList } from './TransferList';
 import { SendPanel } from './SendPanel';
-import { ReceivePanel } from './ReceivePanel';
+import { Spinner } from '../Spinner';
+
+// Lazy-loaded: ReceivePanel pulls in qrcode.react (and React's reconciler
+// path for SVG), which isn't needed until the user actually opens the
+// receive flow. Splitting it off keeps the popup chunk smaller for the
+// common case where users only ever click Send.
+const ReceivePanel = lazy(() =>
+  import('./ReceivePanel').then((m) => ({ default: m.ReceivePanel })),
+);
 
 type ActivePanel = 'send' | 'receive' | null;
-type SendStep = 'input' | 'amount' | 'confirm' | 'sending' | 'success' | 'error';
 
 interface ReadyScreenProps {
   // Header
@@ -133,12 +142,19 @@ export function ReadyScreen({
       )}
 
       {activePanel === 'receive' && (
-        <ReceivePanel
-          invoice={invoice}
-          fetchingInvoice={fetchingInvoice}
-          invoiceCopied={invoiceCopied}
-          onCopy={onInvoiceCopy}
-        />
+        <Suspense fallback={
+          <div className="flex items-center justify-center py-8 gap-2 text-neutral-500">
+            <Spinner className="w-4 h-4 text-neutral-400" />
+            <span className="text-xs">Loading…</span>
+          </div>
+        }>
+          <ReceivePanel
+            invoice={invoice}
+            fetchingInvoice={fetchingInvoice}
+            invoiceCopied={invoiceCopied}
+            onCopy={onInvoiceCopy}
+          />
+        </Suspense>
       )}
 
 

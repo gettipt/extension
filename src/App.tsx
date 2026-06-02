@@ -5,18 +5,21 @@ import {
 } from './crypto'
 import { resolveLnurlPayInfo, fetchInvoiceFromCallback } from './lnurl'
 import type { LnurlPayInfo } from './lnurl'
-import { getItem, setItem, removeItem, getSynced, setItemDual, removeItemDual } from './lib/storage'
+import { getItem, setItem, removeItem, getSynced, setItemDual, setItemsDual, removeItemDual } from './lib/storage'
+import { storeUnlockKey, loadUnlockKey, clearUnlockKey } from './lib/key-store'
 import { sendWalletMessage, connectWalletPort } from './lib/wallet-client'
 import { getMaxFeeSats, getMaxSpendableSats } from './lib/fees'
 import type { WalletTransfer } from './lib/transfers'
+import type { SendStep } from './lib/send-types'
 import {
   PIN_KEY,
   WALLET_KEY,
-  SESSION_PIN_KEY,
+  LEGACY_SESSION_PIN_KEY,
   SENTINEL,
   PIN_LENGTH,
   TRANSFERS_CACHE_KEY,
   PIN_ATTEMPTS_KEY,
+  BTC_USD_RATE_CACHE_KEY,
 } from './constants'
 import {
   getPinAttempts,
@@ -47,7 +50,6 @@ type AppState =
 
 type PinSetupStep = 'enter' | 'confirm';
 type ActivePanel = 'send' | 'receive' | null;
-type SendStep = 'input' | 'amount' | 'confirm' | 'sending' | 'success' | 'error';
 type PendingWalletAction =
   | { type: 'create' }
   | { type: 'recover'; mnemonic: string; fromFile?: boolean }
@@ -215,28 +217,25 @@ export default function App() {
     let cancelled = false;
 
     void (async () => {
+      // Best-effort cleanup of the legacy plaintext PIN entry from pre-S7
+      // installs. The background's onStartup listener handles browser
+      // restarts; this catches the in-session upgrade case.
+      void chrome.storage.session.remove(LEGACY_SESSION_PIN_KEY).catch(() => { /* ignore */ });
+
       const storedWallet = await getSynced(WALLET_KEY);
-      const sessionPin = await getItem('session', SESSION_PIN_KEY);
+      const cachedKey = await loadUnlockKey();
 
-      if (storedWallet && sessionPin) {
+      if (storedWallet && cachedKey) {
         try {
-          const pinRaw = await getSynced(PIN_KEY);
-          if (!pinRaw) throw new Error('PIN_NOT_FOUND');
-
-          const { salt, verifier, iterations } = JSON.parse(pinRaw);
-          const iters = typeof iterations === 'number' && Number.isFinite(iterations)
-            ? iterations
-            : PBKDF2_ITERATIONS_LEGACY;
-          const key = await deriveKey(sessionPin, hexToBuf(salt), iters);
-          const result = await decryptText(key, verifier.iv, verifier.ct);
-          if (result !== SENTINEL) throw new Error('WRONG_SESSION_PIN');
-
           if (!cancelled) {
-            await afterUnlock(key);
+            await afterUnlock(cachedKey);
           }
           return;
         } catch {
-          await removeItem('session', SESSION_PIN_KEY);
+          // The cached key didn't match the stored wallet (e.g. the wallet
+          // was rotated on another device). Wipe the stale key and fall
+          // through to the lock screen.
+          await clearUnlockKey();
         }
       }
 
@@ -258,10 +257,33 @@ export default function App() {
       const nextRate = data.bitcoin?.usd;
       if (typeof nextRate === 'number' && Number.isFinite(nextRate)) {
         setBtcUsdRate(nextRate);
+        // Persist so the next popup open shows a number immediately instead
+        // of '--' while CoinGecko is reached. We cache value + timestamp so
+        // a future enhancement can decide on staleness — today we always
+        // refresh on mount so the cached value is just a visual seed.
+        void setItem('local', BTC_USD_RATE_CACHE_KEY, JSON.stringify({ rate: nextRate, ts: Date.now() }))
+          .catch(() => { /* ignore quota errors; the price isn't critical */ });
       }
     } catch {
       // Ignore transient pricing errors and keep the last known rate.
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Seed from the persisted cache so we don't render '--' on every popup
+    // open while waiting for CoinGecko.
+    void (async () => {
+      try {
+        const raw = await getItem('local', BTC_USD_RATE_CACHE_KEY);
+        if (cancelled || !raw) return;
+        const parsed = JSON.parse(raw) as { rate?: number };
+        if (typeof parsed.rate === 'number' && Number.isFinite(parsed.rate)) {
+          setBtcUsdRate((prev) => prev ?? parsed.rate!);
+        }
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -339,7 +361,10 @@ export default function App() {
       const key = await deriveKey(pinInput, salt, iterations);
       const verifier = await encryptText(key, SENTINEL);
       await setItemDual(PIN_KEY, JSON.stringify({ salt: bufToHex(salt), iterations, verifier }));
-      await setItem('session', SESSION_PIN_KEY, pinInput);
+      // S7: cache the non-extractable CryptoKey in shared IndexedDB so the
+      // offscreen / background contexts can decrypt the wallet without the
+      // PIN ever leaving this function.
+      await storeUnlockKey(key);
       await clearPinAttempts();
       setPinInput('');
       setPinConfirm('');
@@ -400,29 +425,42 @@ export default function App() {
         throw new Error('Wrong PIN.');
       }
       await clearPinAttempts();
-      await setItem('session', SESSION_PIN_KEY, pin);
+      // S7: stash the derived AES key in shared IndexedDB. This replaces the
+      // previous `chrome.storage.session.set('spark_session_pin', pin)` —
+      // the raw PIN is now never persisted anywhere on disk or in
+      // structured storage.
+      await storeUnlockKey(key);
 
-      // Lazy iterations migration: re-encrypt verifier + wallet blob with new iterations.
+      // S3 + Lazy iterations migration: when an old-iterations payload is
+      // detected, re-encrypt BOTH the verifier and the wallet ciphertext
+      // under a new key derived at PBKDF2_ITERATIONS_DEFAULT, then commit
+      // both blobs in a single chrome.storage.local.set so they can never
+      // diverge. The previous implementation wrote PIN first then wallet,
+      // leaving a window in which a power-loss/quota-error would brick
+      // the wallet (new PIN verifier but old-key ciphertext).
       if (storedIterations < PBKDF2_ITERATIONS_DEFAULT) {
         try {
           const newSalt = crypto.getRandomValues(new Uint8Array(16));
           const newKey = await deriveKey(pin, newSalt, PBKDF2_ITERATIONS_DEFAULT);
           const newVerifier = await encryptText(newKey, SENTINEL);
-          await setItemDual(PIN_KEY, JSON.stringify({
-            salt: bufToHex(newSalt),
-            iterations: PBKDF2_ITERATIONS_DEFAULT,
-            verifier: newVerifier,
-          }));
           const walletRaw = await getSynced(WALLET_KEY);
           if (walletRaw) {
             const { iv: wIv, ct: wCt } = JSON.parse(walletRaw);
             const mnemonic = await decryptText(key, wIv, wCt);
             const reEnc = await encryptText(newKey, mnemonic);
-            await setItemDual(WALLET_KEY, JSON.stringify(reEnc));
+            await setItemsDual({
+              [WALLET_KEY]: JSON.stringify(reEnc),
+              [PIN_KEY]: JSON.stringify({
+                salt: bufToHex(newSalt),
+                iterations: PBKDF2_ITERATIONS_DEFAULT,
+                verifier: newVerifier,
+              }),
+            });
+            await storeUnlockKey(newKey);
+            setPinInput('');
+            await afterUnlock(newKey);
+            return;
           }
-          setPinInput('');
-          await afterUnlock(newKey);
-          return;
         } catch {
           // Migration best-effort; fall through with old key.
         }
@@ -502,7 +540,9 @@ export default function App() {
         removeItemDual(WALLET_KEY),
         removeItem('local', TRANSFERS_CACHE_KEY),
         removeItem('local', PIN_ATTEMPTS_KEY),
-        removeItem('session', SESSION_PIN_KEY),
+        removeItem('local', BTC_USD_RATE_CACHE_KEY),
+        removeItem('session', LEGACY_SESSION_PIN_KEY),
+        clearUnlockKey(),
       ]);
 
       cryptoKeyRef.current = null;
@@ -644,21 +684,15 @@ export default function App() {
       const maxFeeSats = feeEstimateSats !== null
         ? Math.max(Math.ceil(feeEstimateSats * 2), getMaxFeeSats(parseInt(sendAmountSats, 10)))
         : getMaxFeeSats(parseInt(sendAmountSats, 10));
-      // Pass credentials so the offscreen handler can transparently re-init
-      // the wallet if the cached instance was torn down (e.g. by Chrome
-      // restarting the offscreen document under memory pressure).
-      const [sessionPin, pinRaw, walletRaw] = await Promise.all([
-        getItem('session', SESSION_PIN_KEY),
-        getSynced(PIN_KEY),
-        getSynced(WALLET_KEY),
-      ]);
+      // S7: only the encrypted wallet blob is shipped to the offscreen —
+      // the PIN no longer crosses the IPC boundary. The offscreen pulls
+      // the AES key from shared IndexedDB if it needs to re-initialise.
+      const walletRaw = await getSynced(WALLET_KEY);
       const result = await sendWalletMessage<{ ok: boolean; txId?: string; error?: string }>({
         type: 'TIPT_PAY_INVOICE',
         payload: {
           invoice: pendingBolt11,
           maxFeeSats,
-          sessionPin: sessionPin ?? undefined,
-          pinRaw: pinRaw ?? undefined,
           walletRaw: walletRaw ?? undefined,
         },
       });

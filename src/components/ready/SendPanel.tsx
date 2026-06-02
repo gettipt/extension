@@ -1,7 +1,6 @@
 import { Spinner } from '../Spinner';
 import type { LnurlPayInfo } from '../../lnurl';
-
-type SendStep = 'input' | 'amount' | 'confirm' | 'sending' | 'success' | 'error';
+import type { SendStep } from '../../lib/send-types';
 
 interface SendPanelState {
   sendStep: SendStep;

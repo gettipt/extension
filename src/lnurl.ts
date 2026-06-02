@@ -18,28 +18,27 @@ function lightningAddressToUrl(address: string): string {
   return `https://${domain}/.well-known/lnurlp/${user}`;
 }
 
-function isPrivateHost(host: string): boolean {
+function isDisallowedHost(host: string): boolean {
   const h = host.toLowerCase();
+
+  // Block well-known local / special-use names.
   if (h === 'localhost' || h === '0.0.0.0') return true;
   if (h.endsWith('.local') || h.endsWith('.localhost')) return true;
-  // IPv4 literal checks
-  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  if (ipv4) {
-    const [a, b] = [parseInt(ipv4[1], 10), parseInt(ipv4[2], 10)];
-    if (a === 10) return true;
-    if (a === 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 0) return true;
-    if (a >= 224) return true; // multicast / reserved
-  }
-  // Crude IPv6 loopback / link-local / unique-local
-  if (h === '::1' || h === '[::1]') return true;
-  if (h.startsWith('fe80') || h.startsWith('[fe80')) return true;
-  if (h.startsWith('fc') || h.startsWith('fd') || h.startsWith('[fc') || h.startsWith('[fd')) return true;
-  // No .onion
   if (h.endsWith('.onion') || h.endsWith('.onion]')) return true;
+
+  // Reject ALL IP literals. No legitimate LNURL service uses one, and trying
+  // to enumerate private ranges (especially IPv6: ::1, ::ffff:127.0.0.1,
+  // 64:ff9b::/96 NAT64, IPv4-mapped, etc.) is error-prone. Allowlisting DNS
+  // names is strictly safer.
+
+  // IPv4 literal (URL.hostname returns no brackets for IPv4).
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true;
+
+  // IPv6 literal: URL.hostname returns these wrapped in brackets, and a colon
+  // is otherwise illegal in a hostname (ports are separated and stripped).
+  if (h.includes(':')) return true;
+  if (h.startsWith('[') || h.endsWith(']')) return true;
+
   return false;
 }
 
@@ -53,11 +52,16 @@ function assertSafeUrl(rawUrl: string): URL {
   if (url.protocol !== 'https:') {
     throw new Error('LNURL endpoints must use https.');
   }
-  if (isPrivateHost(url.hostname)) {
+  if (isDisallowedHost(url.hostname)) {
     throw new Error('LNURL endpoint host is not allowed.');
   }
   return url;
 }
+
+// Default fetch options used for every LNURL HTTP call. `redirect: 'error'`
+// turns any 3xx response into a network error, so a server cannot redirect us
+// to a private network or a non-HTTPS scheme after the initial assertSafeUrl.
+const LNURL_FETCH_OPTIONS: RequestInit = { redirect: 'error' };
 
 export async function resolveLnurlPayInfo(input: string): Promise<LnurlPayInfo> {
   let url: string;
@@ -72,7 +76,7 @@ export async function resolveLnurlPayInfo(input: string): Promise<LnurlPayInfo> 
   }
 
   const safeUrl = assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString());
+  const res = await fetch(safeUrl.toString(), LNURL_FETCH_OPTIONS);
   if (!res.ok) throw new Error(`LNURL fetch failed: ${res.status}`);
   const data = await res.json();
   if (data && data.status === 'ERROR') throw new Error(data.reason ?? 'LNURL error');
@@ -114,7 +118,7 @@ export async function fetchInvoiceFromCallback(
 ): Promise<string> {
   const url = `${callback}${callback.includes('?') ? '&' : '?'}amount=${amountMsats}`;
   const safeUrl = assertSafeUrl(url);
-  const res = await fetch(safeUrl.toString());
+  const res = await fetch(safeUrl.toString(), LNURL_FETCH_OPTIONS);
   if (!res.ok) throw new Error(`Invoice fetch failed: ${res.status}`);
   const data = await res.json();
   if (data && data.status === 'ERROR') throw new Error(data.reason ?? 'Invoice error');

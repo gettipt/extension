@@ -1,16 +1,16 @@
 /// <reference types="chrome" />
 
 import { log } from './lib/logger';
+import { ensureOffscreen } from './lib/offscreen';
+import { clearUnlockKey } from './lib/key-store';
 
 // Background service worker.
 
 const GREEN_ICON = 'greenasterisk.png';
 const MPP_REQUEST_TRIGGERED_EVENT = 'TIPT_MPP_REQUEST_TRIGGERED';
 const ALLOWLIST_KEY = 'tipt_402_allowlist';
-const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 let allowlistCache: Record<string, true> | null = null;
 let allowlistLoadPromise: Promise<Record<string, true>> | null = null;
-let offscreenInitPromise: Promise<void> | null = null;
 
 interface ChallengePayload {
   scheme: string;
@@ -57,6 +57,24 @@ function getHostFromUrl(rawUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+// All onMessage handlers in this file require the sender to be our own
+// extension context. Without this we would be relying on Chrome's default
+// behavior (only same-extension messages reach onMessage when
+// externally_connectable is not configured), but enforcing it explicitly
+// hardens the contract.
+function isInternalSender(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id;
+}
+
+// The confirm popup is the only context allowed to drive the per-request
+// approval handshake. Restrict acceptance to messages whose sender URL is
+// our own confirm.html.
+function isConfirmPopup(sender: chrome.runtime.MessageSender): boolean {
+  if (!isInternalSender(sender)) return false;
+  const expected = chrome.runtime.getURL('confirm.html');
+  return typeof sender.url === 'string' && sender.url.startsWith(expected);
 }
 
 async function getAllowlist(): Promise<Record<string, true>> {
@@ -129,6 +147,15 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   allowlistCache = parsed;
 });
 
+// Mimic chrome.storage.session lifetime for the IndexedDB-cached unlock key:
+// wipe it on browser startup so a stolen-laptop attacker can't reuse a
+// previously-unlocked key after power-cycling. Also clear the legacy
+// spark_session_pin entry from old installs.
+chrome.runtime.onStartup.addListener(() => {
+  void clearUnlockKey();
+  void chrome.storage.session.remove('spark_session_pin').catch(() => { /* best-effort */ });
+});
+
 function toBase64UrlUtf8(value: string): string {
   const bytes = new TextEncoder().encode(value);
   let binary = '';
@@ -156,9 +183,10 @@ function jcsStringify(value: unknown): string {
 }
 
 function decodeOpaqueToObject(opaque: string): Record<string, string> | undefined {
+  // Cap input length so a hostile server cannot send megabytes of base64
+  // and force us through a slow JSON.parse before falling back.
+  if (opaque.length > 4096) return undefined;
   try {
-    // The opaque is base64url-encoded JSON. Older mppx server versions expect
-    // the decoded object in the credential echo, not the raw base64url string.
     const json = atob(opaque.replace(/-/g, '+').replace(/_/g, '/').padEnd(
       opaque.length + (4 - opaque.length % 4) % 4, '=',
     ));
@@ -180,9 +208,6 @@ function buildAuthorizationValue(challenge: ChallengePayload, preimage: string):
       return null;
     }
 
-    // Decode opaque from base64url to its JSON object. Older server-side mppx
-    // versions expect the opaque as an object (legacy format) rather than the
-    // spec-compliant base64url string introduced in newer versions.
     const opaqueObj = paymentChallenge.opaque
       ? decodeOpaqueToObject(paymentChallenge.opaque)
       : undefined;
@@ -229,7 +254,7 @@ interface PendingConfirm {
 const pendingConfirms = new Map<string, PendingConfirm>();
 const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
 
-function promptForPaymentApproval(_tabId: number, payload: PayRequestPayload, host: string): Promise<PromptResponse> {
+function promptForPaymentApproval(payload: PayRequestPayload, host: string): Promise<PromptResponse> {
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
     const details = {
@@ -263,51 +288,12 @@ function promptForPaymentApproval(_tabId: number, payload: PayRequestPayload, ho
   });
 }
 
-async function ensureOffscreenDocument(): Promise<void> {
-  if (!chrome.offscreen?.createDocument) {
-    throw new Error('Offscreen documents are not supported in this Chrome runtime.');
-  }
-
-  if (!offscreenInitPromise) {
-    offscreenInitPromise = (async () => {
-      if (chrome.offscreen.hasDocument) {
-        const hasDocument = await chrome.offscreen.hasDocument();
-        if (hasDocument) {
-          return;
-        }
-      }
-
-      try {
-        await chrome.offscreen.createDocument({
-          url: OFFSCREEN_DOCUMENT_PATH,
-          reasons: ['LOCAL_STORAGE'],
-          justification: 'Process Spark SDK invoice payments outside the service worker runtime.',
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes('Only a single offscreen document may be created')) {
-          throw error;
-        }
-      }
-    })().finally(() => {
-      offscreenInitPromise = null;
-    });
-  }
-
-  await offscreenInitPromise;
-}
-
-function requestPreimageFromOffscreen(
-  invoice: string,
-  sessionPin: string,
-  pinRaw: string,
-  walletRaw: string,
-): Promise<string> {
+function requestPreimageFromOffscreen(invoice: string, walletRaw: string): Promise<string> {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
         type: 'TIPT_OFFSCREEN_PAY_INVOICE',
-        payload: { invoice, sessionPin, pinRaw, walletRaw },
+        payload: { invoice, walletRaw },
       },
       (response: OffscreenPayResponse) => {
         if (chrome.runtime.lastError) {
@@ -334,9 +320,15 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
     return { approved: false, error: 'No invoice found in 402 challenge.' };
   }
 
-  const host = getHostFromUrl(payload.url);
+  // SECURITY: derive the host from `sender.url` (or `sender.tab?.url`),
+  // which the browser sets to the URL of the frame that dispatched the
+  // CustomEvent — NEVER from `payload.url`, which is page-supplied and
+  // therefore spoofable. A malicious page could otherwise claim
+  // `url: 'https://victim-you-allowlisted.com/'` and trigger auto-approve.
+  const authoritativeUrl = sender.url ?? sender.tab?.url;
+  const host = authoritativeUrl ? getHostFromUrl(authoritativeUrl) : null;
   if (!host) {
-    log('[TIPT-BG] Failed to extract host from URL:', payload.url);
+    log('[TIPT-BG] Failed to extract host from sender URL');
     return { approved: false, error: 'Failed to resolve request host for 402 payment.' };
   }
 
@@ -346,13 +338,12 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
 
   if (!approved) {
     log('[TIPT-BG] Host not remembered, prompting user');
-    const tabId = sender.tab?.id;
-    if (tabId === undefined) {
+    if (sender.tab?.id === undefined) {
       log('[TIPT-BG] No tab ID available for prompt');
       return { approved: false, error: 'Cannot prompt for 402 payment approval in this context.' };
     }
 
-    const prompt = await promptForPaymentApproval(tabId, payload, host);
+    const prompt = await promptForPaymentApproval(payload, host);
     approved = !!prompt.approved;
     remember = !!prompt.remember;
     log('[TIPT-BG] User prompt result - approved:', approved, 'remember:', remember);
@@ -373,25 +364,22 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
   try {
     log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
 
-    // Read credentials in background (offscreen docs lack chrome.storage access).
-    const sessionItems = await chrome.storage.session.get(['spark_session_pin']);
-    const sessionPin = typeof sessionItems['spark_session_pin'] === 'string' ? sessionItems['spark_session_pin'] : null;
-    if (!sessionPin) {
-      return { approved: false, error: 'Wallet is locked. Open TIPT and unlock first.' };
-    }
-    const localItems = await chrome.storage.local.get(['spark_pin', 'spark_wallet']);
-    const syncItems = await chrome.storage.sync.get(['spark_pin', 'spark_wallet']);
-    const pinRaw = typeof localItems['spark_pin'] === 'string' ? localItems['spark_pin']
-      : typeof syncItems['spark_pin'] === 'string' ? syncItems['spark_pin'] : null;
+    // Background can read chrome.storage; the offscreen cannot. Pass the
+    // encrypted wallet blob along so the offscreen can re-initialise its
+    // SDK instance if Chrome reclaimed the offscreen document. The PIN
+    // never crosses this boundary — the offscreen decrypts using the
+    // non-extractable CryptoKey cached in shared IndexedDB.
+    const localItems = await chrome.storage.local.get(['spark_wallet']);
+    const syncItems = await chrome.storage.sync.get(['spark_wallet']);
     const walletRaw = typeof localItems['spark_wallet'] === 'string' ? localItems['spark_wallet']
       : typeof syncItems['spark_wallet'] === 'string' ? syncItems['spark_wallet'] : null;
-    if (!pinRaw || !walletRaw) {
+    if (!walletRaw) {
       return { approved: false, error: 'Wallet data not found.' };
     }
 
-    await ensureOffscreenDocument();
-    const preimage = await requestPreimageFromOffscreen(invoice, sessionPin, pinRaw, walletRaw);
-    log('[TIPT-BG] Payment successful, preimage:', preimage, '(len:', preimage.length, ')');
+    await ensureOffscreen();
+    const preimage = await requestPreimageFromOffscreen(invoice, walletRaw);
+    log('[TIPT-BG] Payment successful, preimage len:', preimage.length);
 
     const authorization = buildAuthorizationValue(payload.challenge, preimage);
     if (!authorization) {
@@ -410,8 +398,11 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!isInternalSender(sender)) return;
+
   if (message?.type === MPP_REQUEST_TRIGGERED_EVENT) {
     log('[TIPT-BG] mpp:request listener trigger received');
+    // Must originate from a content script (which sets sender.tab).
     const tabId = sender.tab?.id;
     if (tabId !== undefined) {
       chrome.action.setIcon({ tabId, path: GREEN_ICON });
@@ -420,6 +411,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'TIPT_402_CONFIRM_READY') {
+    if (!isConfirmPopup(sender)) {
+      sendResponse({ ok: false, error: 'Unauthorized sender.' });
+      return;
+    }
     const id = message.payload?.id;
     const pending = typeof id === 'string' ? pendingConfirms.get(id) : undefined;
     if (!pending) {
@@ -431,6 +426,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === 'TIPT_402_CONFIRM_RESPONSE') {
+    if (!isConfirmPopup(sender)) {
+      sendResponse({ ok: false, error: 'Unauthorized sender.' });
+      return;
+    }
     const id = message.payload?.id;
     const approved = !!message.payload?.approved;
     const remember = !!message.payload?.remember;
@@ -448,6 +447,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  // 402 payment requests must originate from a content script in a real tab.
+  if (!sender.tab || !sender.url) {
+    log('[TIPT-BG] 402 request missing sender.tab/sender.url; dropping');
+    return;
+  }
+
   log('[TIPT-BG] Payment request message received from content script');
   const payload = message.payload as PayRequestPayload;
   void handle402PaymentRequest(payload, sender).then((response) => {
@@ -457,4 +462,3 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return true;
 });
-

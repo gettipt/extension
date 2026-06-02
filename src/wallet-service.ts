@@ -1,13 +1,8 @@
-import { SparkWallet } from '@buildonspark/spark-sdk'
-import { decryptText, deriveKey, hexToBuf, PBKDF2_ITERATIONS_LEGACY } from './crypto'
+/// <reference lib="dom" />
 
-const SENTINEL = 'spark_wallet_v1';
-
-interface PinPayload {
-  salt: string;
-  iterations?: number;
-  verifier: { iv: string; ct: string };
-}
+import { SparkWallet } from '@buildonspark/spark-sdk';
+import { decryptText } from './crypto';
+import { loadUnlockKey } from './lib/key-store';
 
 interface WalletPayload {
   iv: string;
@@ -30,7 +25,18 @@ function getResultString(result: unknown, keys: string[]): string | null {
   return null;
 }
 
-async function disposeWallet(wallet: SparkWallet | null) {
+const TERMINAL_FAILURE_STATUSES = new Set([
+  'LIGHTNING_PAYMENT_FAILED',
+  'PREIMAGE_PROVIDING_FAILED',
+  'USER_TRANSFER_VALIDATION_FAILED',
+]);
+
+let cachedWallet: SparkWallet | null = null;
+let walletInitPromise: Promise<SparkWallet> | null = null;
+
+// Unified teardown for the SparkWallet SDK instance. Best-effort: we never
+// want a dispose failure to surface to the user.
+async function teardownWallet(wallet: SparkWallet | null): Promise<void> {
   if (!wallet) return;
   const w = wallet as unknown as { cleanupConnections?: () => Promise<void> | void };
   try {
@@ -41,41 +47,40 @@ async function disposeWallet(wallet: SparkWallet | null) {
   try { wallet.removeAllListeners?.(); } catch { /* best-effort */ }
 }
 
-async function decryptMnemonicFromCredentials(sessionPin: string, pinRaw: string, walletRaw: string): Promise<string> {
-  const pinPayload = JSON.parse(pinRaw) as PinPayload;
-  const walletPayload = JSON.parse(walletRaw) as WalletPayload;
-  const iterations = typeof pinPayload.iterations === 'number' && Number.isFinite(pinPayload.iterations)
-    ? pinPayload.iterations
-    : PBKDF2_ITERATIONS_LEGACY;
-  const key = await deriveKey(sessionPin, hexToBuf(pinPayload.salt), iterations);
-  const verifier = await decryptText(key, pinPayload.verifier.iv, pinPayload.verifier.ct);
-  if (verifier !== SENTINEL) {
-    throw new Error('Session PIN is invalid. Unlock TIPT again.');
+// Decrypt the wallet mnemonic using the AES-GCM key cached in IndexedDB
+// (see lib/key-store.ts). Throws if the user has not unlocked since
+// browser startup, since that's when we wipe the IDB key.
+async function decryptMnemonicWithCachedKey(walletRaw: string): Promise<string> {
+  const key = await loadUnlockKey();
+  if (!key) {
+    throw new Error('Wallet is locked. Open TIPT and unlock first.');
   }
+  const walletPayload = JSON.parse(walletRaw) as WalletPayload;
   return decryptText(key, walletPayload.iv, walletPayload.ct);
 }
 
-const TERMINAL_FAILURE_STATUSES = new Set([
-  'LIGHTNING_PAYMENT_FAILED',
-  'PREIMAGE_PROVIDING_FAILED',
-  'USER_TRANSFER_VALIDATION_FAILED',
-]);
+async function initFromMnemonicInternal(mnemonic?: string): Promise<SparkWallet> {
+  // Caller is expected to have torn down any previous instance.
+  const result = await SparkWallet.initialize({
+    ...(mnemonic ? { mnemonicOrSeed: mnemonic } : {}),
+    options: { network: 'MAINNET' },
+  });
+  cachedWallet = result.wallet;
+  subscribeWalletEvents(result.wallet);
+  return result.wallet;
+}
 
-let cachedWallet: SparkWallet | null = null;
-let walletInitPromise: Promise<SparkWallet> | null = null;
-
-async function getOrCreateWallet(sessionPin: string, pinRaw: string, walletRaw: string): Promise<SparkWallet> {
-  if (cachedWallet) {
-    return cachedWallet;
-  }
+// Ensure the SDK is initialised from the encrypted blob, decrypting with the
+// IndexedDB-cached unlock key. Idempotent: returns the cached wallet if it
+// already exists. Used by the unified payment path when the offscreen
+// document has been torn down between the popup unlock and the pay call.
+export async function ensureWalletFromBlob(walletRaw: string): Promise<SparkWallet> {
+  if (cachedWallet) return cachedWallet;
 
   if (!walletInitPromise) {
     walletInitPromise = (async () => {
-      const mnemonic = await decryptMnemonicFromCredentials(sessionPin, pinRaw, walletRaw);
-      const initialized = await SparkWallet.initialize({ mnemonicOrSeed: mnemonic, options: { network: 'MAINNET' } });
-      cachedWallet = initialized.wallet;
-      subscribeWalletEvents(initialized.wallet);
-      return initialized.wallet;
+      const mnemonic = await decryptMnemonicWithCachedKey(walletRaw);
+      return initFromMnemonicInternal(mnemonic);
     })();
   }
 
@@ -84,6 +89,8 @@ async function getOrCreateWallet(sessionPin: string, pinRaw: string, walletRaw: 
   } catch (error) {
     walletInitPromise = null;
     throw error;
+  } finally {
+    if (cachedWallet) walletInitPromise = null;
   }
 }
 
@@ -120,10 +127,6 @@ async function pollForPreimage(
   throw new Error('Timed out waiting for payment preimage.');
 }
 
-export async function ensureWalletForSession(sessionPin: string, pinRaw: string, walletRaw: string): Promise<SparkWallet> {
-  return getOrCreateWallet(sessionPin, pinRaw, walletRaw);
-}
-
 async function getWalletFeeEstimateRaw(invoice: string): Promise<number | null> {
   if (!cachedWallet) return null;
   const wallet = cachedWallet as unknown as {
@@ -137,61 +140,86 @@ async function getWalletFeeEstimateRaw(invoice: string): Promise<number | null> 
   }
 }
 
-export async function payInvoiceFromSession(
-  invoice: string,
-  sessionPin: string,
-  pinRaw: string,
-  walletRaw: string,
-): Promise<{ preimage: string }> {
-  // Ensure wallet is initialized (decrypt mnemonic + connect SDK if not cached).
-  await ensureWalletForSession(sessionPin, pinRaw, walletRaw);
-
-  // Use the SDK's fee estimate (in sats) plus a buffer to give the router
-  // headroom. If the estimate call fails, fall back to a conservative ceiling.
-  let maxFeeSats = 50;
-  const estimatedFee = await getWalletFeeEstimateRaw(invoice);
-  if (estimatedFee !== null) {
-    maxFeeSats = Math.max(25, Math.ceil(estimatedFee * 2));
-  }
-
-  // Pay via the unified path.
-  const payResult = await payWalletInvoice(invoice, maxFeeSats);
-
-  // For the 402 flow we need the preimage. Some Spark responses include it
-  // immediately on payLightningInvoice; in our unified path we lose that
-  // detail. We poll the lightning send request by id to get the preimage.
-  if (payResult.preimage) {
-    return { preimage: payResult.preimage };
-  }
-  if (!payResult.txId) {
-    throw new Error('Payment initiated but no request ID returned to poll for preimage.');
-  }
-  if (!cachedWallet) throw new Error('Wallet disposed before preimage was available.');
-  const preimage = await pollForPreimage(cachedWallet, payResult.txId);
-  return { preimage };
+export interface PayOptions {
+  // Encrypted wallet blob — supplied so the offscreen can recover its SDK
+  // instance if Chrome reclaimed the document since the last call.
+  walletRaw?: string;
+  // Pre-computed maximum fee from the caller. When omitted, we ask the SDK
+  // for a fee estimate and apply the standard headroom multiplier.
+  maxFeeSats?: number;
+  // If true, the result is guaranteed to contain `preimage` — we poll the
+  // Lightning send request until the SDK exposes one. Used by the 402 path.
+  pollPreimage?: boolean;
 }
 
-export async function initWalletFromMnemonic(mnemonic?: string): Promise<{ mnemonic: string; balanceSats: bigint }> {
-  await disposeWallet(cachedWallet);
+export interface PayResult {
+  txId?: string;
+  preimage?: string;
+}
+
+// Single unified payment entry point used by both the popup (TIPT_PAY_INVOICE)
+// and the background 402 flow (TIPT_OFFSCREEN_PAY_INVOICE). All recovery,
+// fee estimation, and preimage handling is centralised here.
+export async function payInvoice(invoice: string, options: PayOptions = {}): Promise<PayResult> {
+  if (!cachedWallet) {
+    if (!options.walletRaw) {
+      throw new Error('Wallet not initialized and no encrypted blob provided to re-initialize.');
+    }
+    await ensureWalletFromBlob(options.walletRaw);
+  }
+
+  const wallet = cachedWallet;
+  if (!wallet) throw new Error('Wallet not initialized.');
+
+  let maxFeeSats = options.maxFeeSats;
+  if (maxFeeSats === undefined) {
+    const estimated = await getWalletFeeEstimateRaw(invoice);
+    maxFeeSats = estimated !== null ? Math.max(25, Math.ceil(estimated * 2)) : 50;
+  }
+
+  const result = await wallet.payLightningInvoice({ invoice, maxFeeSats });
+  const r = result as unknown as Record<string, unknown>;
+  const txId = typeof r.id === 'string' ? r.id
+    : typeof r.transferSparkId === 'string' ? r.transferSparkId
+    : undefined;
+  let preimage = typeof r.paymentPreimage === 'string' ? r.paymentPreimage
+    : typeof r.preimage === 'string' ? r.preimage
+    : typeof r.payment_preimage === 'string' ? r.payment_preimage
+    : undefined;
+
+  if (options.pollPreimage && !preimage) {
+    if (!txId) {
+      throw new Error('Payment initiated but no request ID returned to poll for preimage.');
+    }
+    if (!cachedWallet) throw new Error('Wallet disposed before preimage was available.');
+    preimage = await pollForPreimage(cachedWallet, txId);
+  }
+
+  return { txId, preimage };
+}
+
+// Initial wallet creation / recovery path. The popup decrypts the mnemonic
+// locally (using the freshly-derived unlock key) and hands the plaintext
+// mnemonic over so the SDK can initialise. The encrypted blob never crosses
+// the IPC boundary on this path.
+export async function initWalletFromMnemonic(
+  mnemonic?: string,
+): Promise<{ mnemonic: string; balanceSats: bigint }> {
+  await teardownWallet(cachedWallet);
   cachedWallet = null;
   walletInitPromise = null;
 
-  const result = await SparkWallet.initialize({
-    ...(mnemonic ? { mnemonicOrSeed: mnemonic } : {}),
-    options: { network: 'MAINNET' },
-  });
-  cachedWallet = result.wallet;
-  const returnedMnemonic = (result as { mnemonic?: string }).mnemonic ?? mnemonic ?? '';
-  subscribeWalletEvents(result.wallet);
-  const bal = await result.wallet.getBalance();
+  const wallet = await initFromMnemonicInternal(mnemonic);
+  const returnedMnemonic = ((wallet as unknown) as { mnemonic?: string }).mnemonic ?? mnemonic ?? '';
+  const bal = await wallet.getBalance();
   return { mnemonic: returnedMnemonic, balanceSats: bal.balance };
 }
 
-export async function disposeCachedWallet(): Promise<void> {
+export async function disposeWallet(): Promise<void> {
   const walletToDispose = cachedWallet;
   cachedWallet = null;
   walletInitPromise = null;
-  await disposeWallet(walletToDispose);
+  await teardownWallet(walletToDispose);
 }
 
 type WalletEventListener = (event: 'transfer:claimed' | 'deposit:confirmed', balance: bigint) => void;
@@ -261,24 +289,10 @@ export async function getWalletFeeEstimate(encodedInvoice: string): Promise<numb
   throw new Error('Could not determine fee estimate.');
 }
 
-export async function payWalletInvoice(invoice: string, maxFeeSats: number): Promise<{ txId?: string; preimage?: string }> {
-  if (!cachedWallet) throw new Error('Wallet not initialized.');
-  const result = await cachedWallet.payLightningInvoice({ invoice, maxFeeSats });
-  const r = result as unknown as Record<string, unknown>;
-  const txId = typeof r.id === 'string' ? r.id : typeof r.transferSparkId === 'string' ? r.transferSparkId : undefined;
-  const preimage = typeof r.paymentPreimage === 'string' ? r.paymentPreimage
-    : typeof r.preimage === 'string' ? r.preimage
-    : typeof r.payment_preimage === 'string' ? r.payment_preimage
-    : undefined;
-  return { txId, preimage };
-}
-
-export async function hasCachedWallet(): Promise<{ hasWallet: boolean; balanceSats?: bigint }> {
-  if (!cachedWallet) return { hasWallet: false };
-  try {
-    const balance = await cachedWallet.getBalance();
-    return { hasWallet: true, balanceSats: balance.balance };
-  } catch {
-    return { hasWallet: false };
-  }
+// Synchronous-style introspection used by the popup to decide whether to
+// show a loading spinner before requesting the first balance. Deliberately
+// does NOT round-trip to the Spark cluster — the previous implementation
+// called getBalance() and made every popup open slow.
+export function hasCachedWallet(): boolean {
+  return cachedWallet !== null;
 }

@@ -7,9 +7,10 @@ export function log(...args: unknown[]): void {
 
 export function warn(...args: unknown[]): void {
   if (DEBUG) console.warn(...args);
-  // Always surface errors though
 }
 
+// `error` is intentionally always on so production builds still surface
+// genuine failures via the extension console.
 export function error(...args: unknown[]): void {
   console.error(...args);
 }

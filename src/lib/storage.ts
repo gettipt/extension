@@ -34,6 +34,21 @@ export async function setItemDual(key: string, value: string): Promise<void> {
   ]);
 }
 
+// Atomic dual write of multiple keys. The local `set` commits all keys together
+// or none — Chrome's storage.local guarantees this for a single `.set` call —
+// so two interdependent blobs (e.g. PIN payload + wallet ciphertext during a
+// PBKDF2 re-encryption migration) cannot end up in an inconsistent state on
+// the primary device. Sync is still best-effort and may diverge; `getSynced`
+// transparently backfills divergence on the next read.
+export async function setItemsDual(items: Record<string, string>): Promise<void> {
+  await chrome.storage.local.set(items);
+  try {
+    await chrome.storage.sync.set(items);
+  } catch {
+    /* best-effort cross-device propagation */
+  }
+}
+
 // Read local first (fast), fall back to sync (cross-device restore). When the
 // value lives only in local but not in sync, backfill sync transparently so
 // other signed-in devices can pick it up. When the value lives only in sync

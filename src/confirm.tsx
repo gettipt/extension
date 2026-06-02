@@ -3,8 +3,12 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 import ConfirmApp from './ConfirmApp';
 
-createRoot(document.getElementById('confirm-root')!).render(
+const tree = import.meta.env.DEV ? (
   <StrictMode>
     <ConfirmApp />
-  </StrictMode>,
+  </StrictMode>
+) : (
+  <ConfirmApp />
 );
+
+createRoot(document.getElementById('confirm-root')!).render(tree);

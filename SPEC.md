@@ -37,7 +37,7 @@ TIPT is a Chrome extension that embeds a self-custodial Lightning wallet and han
 - `spark_pin` and `spark_wallet` are written to **both `chrome.storage.local` (fast, per-device) and `chrome.storage.sync` (cross-device propagation via the user's signed-in Chrome profile)**. Encrypted blobs are well under the per-item 8 KB sync quota.
 - Reads go through `getSynced(key)` (`src/lib/storage.ts`), which prefers `local` and falls back to `sync`. When a value is found only in `local` (e.g., a previous install that wrote to `local`-only), `getSynced` transparently backfills `sync`. When a value is found only in `sync` (e.g., a brand-new device signed into the same Chrome profile), `getSynced` caches it to `local` for subsequent fast reads.
 - Sync writes are best-effort: a failed `sync.set` (quota, disabled, etc.) does not block the local write. Reset (`removeItemDual`) clears both areas.
-- Device-only keys (`spark_pin_attempts`, `spark_transfers_cache`, `tipt_402_allowlist`, `spark_session_pin`) remain in their respective single areas — they are not synced.
+- Device-only keys (`spark_pin_attempts`, `spark_transfers_cache`, `tipt_402_allowlist`, `spark_btc_usd_rate`) remain in their respective single areas — they are not synced. The PIN-derived AES-GCM `CryptoKey` is cached separately in shared **IndexedDB** (`src/lib/key-store.ts`) as a non-extractable handle — never as raw PIN bytes — and is cleared on browser startup so it behaves like the old session-only PIN.
 
 ### Network
 - Wallets connect to the **Spark SDK** on **Mainnet**.
@@ -86,20 +86,20 @@ Tapping **Review & Pay**:
 6. **Fee safety guard**: if `amount + fee > balance`, the send amount is automatically reduced to `balance − fee` and a new invoice is fetched for the adjusted amount. The fee is re-estimated for the adjusted invoice (falling back to the previously computed fee).
 7. The **Review** screen is shown with: Amount / Network fee / Total deducted.
 
-Tapping **Confirm & Pay** on the review screen sends `TIPT_PAY_INVOICE` (with `{ invoice, maxFeeSats, sessionPin?, pinRaw?, walletRaw? }`) to the offscreen. The credentials are included so the offscreen handler can re-initialize the SparkWallet if the cached instance has been torn down. On success, the success notification is shown and automatically dismissed after **5 seconds**, returning to the main screen.
+Tapping **Confirm & Pay** on the review screen sends `TIPT_PAY_INVOICE` (with `{ invoice, maxFeeSats, walletRaw? }`) to the offscreen. The encrypted wallet blob is included so the offscreen handler can re-initialize the SparkWallet if the cached instance has been torn down — the AES-GCM key required to decrypt it is loaded from shared IndexedDB inside the offscreen, so the PIN never crosses the IPC boundary. On success, the success notification is shown and automatically dismissed after **5 seconds**, returning to the main screen.
 
 ### Send Max
 - Clicking **Send Max** populates the amount field with the full wallet balance (raw `balanceSats`).
 - On **Review & Pay**, the effective send amount is computed as `getMaxSpendableSats(balance)` (fee-adjusted), capped by the LNURL maximum.
 
 ### Fee policy
-- Formula: `getMaxFeeSats(amount) = max(5, ceil(amount × 0.0017))` sats (17 bps, minimum 5 sats). Implemented in `src/lib/fees.ts`.
-- `getMaxSpendableSats(balance)` returns the largest `a` such that `a + getMaxFeeSats(a) ≤ balance`. The implementation is algebraic — `floor((balance − 5) × 10000 / 10017)` — with a tiny ±1 correction at the boundary; no general-purpose loop.
+- Formula: `getMaxFeeSats(amount) = max(25, ceil(amount × 0.0017))` sats (17 bps, minimum 25 sats). Implemented in `src/lib/fees.ts`.
+- `getMaxSpendableSats(balance)` returns the largest `a` such that `a + getMaxFeeSats(a) ≤ balance`. The implementation is algebraic — `floor((balance − 25) × 10000 / 10017)` — with a tiny ±1 correction at the boundary; no general-purpose loop.
 - For the send UI, the offscreen's `getLightningSendFeeEstimate` is always attempted first via `TIPT_GET_FEE_ESTIMATE`; the formula is the fallback.
-- For automated 402 payments (background → offscreen), `getLightningSendFeeEstimate` is called first inside `payInvoiceFromSession`. If it returns a finite `feeEstimate`/`fee`/`estimatedFee`, that value is used (clamped to at least 5). Otherwise the formula is applied to the invoice amount returned by the SDK; 50 sats is the final fallback.
+- For automated 402 payments (background → offscreen), `getLightningSendFeeEstimate` is called first inside `payInvoice`. If it returns a finite `feeEstimate`/`fee`/`estimatedFee`, that value is used (clamped to at least 25). Otherwise the formula is applied to the invoice amount returned by the SDK; 50 sats is the final fallback.
 
 ### Payment execution
-- The popup sends `TIPT_PAY_INVOICE` to the offscreen with `{ invoice, maxFeeSats: max(feeEstimate, getMaxFeeSats(amount)), sessionPin?, pinRaw?, walletRaw? }`. The offscreen first checks whether a wallet is cached. If not, and credentials were supplied, it calls `ensureWalletForSession` to re-initialize before paying. It then calls `payWalletInvoice` (which wraps `payLightningInvoice` on the cached SDK instance) and returns `{ ok, txId? }`.
+- The popup sends `TIPT_PAY_INVOICE` to the offscreen with `{ invoice, maxFeeSats: max(feeEstimate, getMaxFeeSats(amount)), walletRaw? }`. The offscreen first checks whether a wallet is cached. If not, and `walletRaw` was supplied, it calls `ensureWalletFromBlob` (which uses the cached AES key from IndexedDB) to re-initialize before paying. It then calls the unified `payInvoice` helper (which wraps `payLightningInvoice` on the cached SDK instance) and returns `{ ok, txId? }`.
 - After a successful payment the popup immediately sends `TIPT_GET_BALANCE` to the offscreen to refresh the displayed balance.
 
 ---
@@ -256,7 +256,7 @@ The offscreen `chrome.runtime.onMessage` listener is structured as a single hand
 | `TIPT_GET_TRANSFERS` | `{ limit, offset }` | `{ ok, transfers }` |
 | `TIPT_CREATE_INVOICE` | `{ amountSats }` | `{ ok, invoice }` |
 | `TIPT_GET_FEE_ESTIMATE` | `{ encodedInvoice }` | `{ ok, feeSats }` |
-| `TIPT_PAY_INVOICE` | `{ invoice, maxFeeSats, sessionPin?, pinRaw?, walletRaw? }` | `{ ok, txId? }` (handler auto-initializes the wallet from the credentials if no cached instance exists) |
+| `TIPT_PAY_INVOICE` | `{ invoice, maxFeeSats, walletRaw? }` | `{ ok, txId? }` (handler auto-initializes the wallet from `walletRaw` + the IndexedDB-cached AES key if no cached SDK instance exists) |
 | `TIPT_HAS_WALLET` | *(none)* | `{ ok, hasWallet, balanceSats? }` (returns cached balance when a wallet is initialized) |
 | `TIPT_DISPOSE_WALLET` | *(none)* | `{ ok }` (popup sends this from the wallet-reset flow so the offscreen tears down its SDK instance) |
 
@@ -279,13 +279,11 @@ Because the offscreen document cannot access `chrome.storage`, the background re
 ```ts
 {
   invoice: string,      // BOLT11 to pay
-  sessionPin: string,   // from chrome.storage.session
-  pinRaw: string,       // PIN payload (local first, sync fallback for legacy installs)
   walletRaw: string,    // encrypted mnemonic (local first, sync fallback for legacy installs)
 }
 ```
 
-`payInvoiceFromSession` (in `wallet-service.ts`) now calls the same `ensureWalletForSession` + `payWalletInvoice` helpers that the popup uses (unified pay path). After payment, if the SDK response does not already contain a preimage, the 402 path polls `getLightningSendRequest` every **750 ms** for up to **60 seconds** to retrieve it. The popup send flow does not poll — it returns the `txId` from the immediate `payLightningInvoice` result.
+`payInvoice` (in `wallet-service.ts`) is the single unified pay path used by both the popup send flow and the background 402 flow. When called from the 402 path with `pollPreimage: true`, if the SDK response does not already contain a preimage it polls `getLightningSendRequest` every **750 ms** for up to **60 seconds** to retrieve it. The popup send flow does not poll — it returns the `txId` from the immediate `payLightningInvoice` result.
 
 `disposeWallet` calls only `cleanupConnections()` and `removeAllListeners()`; the previous custom teardown logic was removed.
 
@@ -361,7 +359,7 @@ src/
 - **Wallet secrets in both `chrome.storage.local` and `chrome.storage.sync`** via `setItemDual`. Local is the primary read path (fast); sync exists so a user signed into the same Chrome profile on another device automatically picks up their encrypted wallet. The PIN is required on every device to decrypt — sync only transports the ciphertext.
 - **Mnemonic not retained in React state** after the app reaches `ready`. The backup-download flow re-derives the mnemonic on demand using the cached `CryptoKey`.
 - **Confirm popup window** replaces the page-level `window.confirm`, so a hostile page cannot suppress, race, or visually spoof the dialog.
-- **Plaintext session PIN in `chrome.storage.session`** is retained intentionally (with a code comment in `src/constants.ts`) because removing it would break the background 402 payment flow, which must decrypt the wallet without user interaction. Tracked as future work behind a UX change (e.g. an explicit "allow background payments" opt-in).
+- **PIN-derived AES-GCM key cached in shared IndexedDB** (`src/lib/key-store.ts`) as a **non-extractable** `CryptoKey`. The raw PIN is never persisted — the previous `chrome.storage.session` entry that held it in plaintext has been removed. Background, popup, and offscreen contexts share the same extension-origin IDB and read the key directly to decrypt the wallet on 402 challenges without user interaction. `chrome.runtime.onStartup` clears the IDB entry on every browser launch, so the key's lifetime still matches a single browser session.
 
 ---
 
@@ -394,7 +392,8 @@ src/
 |---|---|---|
 | `spark_pin` | `chrome.storage.local` + `chrome.storage.sync` | `{ salt, iterations, verifier: { iv, ct } }`. Written via `setItemDual` (both areas). Reads via `getSynced` (local first, sync fallback). |
 | `spark_wallet` | `chrome.storage.local` + `chrome.storage.sync` | Encrypted BIP-39 mnemonic: `{ iv, ct }`. Written via `setItemDual` (both areas). Reads via `getSynced` (local first, sync fallback). |
-| `spark_session_pin` | `chrome.storage.session` | Plaintext PIN for current browser session. **Intentionally retained** so the background 402 flow can decrypt the wallet without user interaction (see *Security notes*). |
+| `tipt_unlock_key` (IndexedDB) | shared `IDBDatabase` at extension origin | Non-extractable PBKDF2/AES-GCM `CryptoKey`. Stored via `src/lib/key-store.ts`. Cleared on `chrome.runtime.onStartup`, so its lifetime mirrors the previous `chrome.storage.session` PIN entry — but the raw PIN is never persisted. |
+| `spark_btc_usd_rate` | `chrome.storage.local` | `{ rate: number, fetchedAt: number }` cached BTC→USD spot for the equivalent display. Refreshed every 5 minutes. |
 | `spark_transfers_cache` | `chrome.storage.local` | AES-GCM-encrypted JSON of the 10 most recent transfers, keyed by the PIN-derived `CryptoKey`. |
 | `spark_pin_attempts` | `chrome.storage.local` | `{ count, lockedUntil }` for PIN unlock throttling. |
 | `tipt_402_allowlist` | `chrome.storage.local` | `{ [host]: true }` auto-approve map for the 402 confirm flow. |
