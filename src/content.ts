@@ -1,5 +1,12 @@
 /// <reference types="chrome" />
 
+// IMPORTANT: Content scripts in MV3 are loaded as classic scripts, not ES
+// modules. They cannot use `import` statements at runtime. Keep this file
+// self-contained: do NOT import from any other module in this codebase.
+
+const DEBUG = (import.meta as { env?: { DEV?: boolean } }).env?.DEV === true;
+function log(...args: unknown[]): void { if (DEBUG) console.log(...args); }
+
 const MPP_REQUEST_TRIGGERED_EVENT = 'TIPT_MPP_REQUEST_TRIGGERED';
 
 interface MppPayDetail {
@@ -53,11 +60,11 @@ window.addEventListener('mpp:request', () => {
 window.addEventListener('mpp:pay', (event: Event) => {
   const detail = (event as CustomEvent<MppPayDetail>).detail;
   if (!detail?.requestId || !detail?.invoice) {
-    console.log('[TIPT-CS] mpp:pay received with missing requestId or invoice');
+    log('[TIPT-CS] mpp:pay received with missing requestId or invoice');
     return;
   }
 
-  console.log('[TIPT-CS] mpp:pay received, requestId:', detail.requestId);
+  log('[TIPT-CS] mpp:pay received, requestId:', detail.requestId);
 
   void sendRuntimeMessage<PayResponse>({
     type: 'TIPT_402_PAY_REQUEST',
@@ -75,7 +82,7 @@ window.addEventListener('mpp:pay', (event: Event) => {
     },
   })
     .then((response) => {
-      console.log('[TIPT-CS] Payment response:', response);
+      log('[TIPT-CS] Payment response:', response);
       window.dispatchEvent(new CustomEvent('mpp:payresponse', {
         detail: {
           requestId: detail.requestId,
@@ -87,45 +94,9 @@ window.addEventListener('mpp:pay', (event: Event) => {
     })
     .catch((error: unknown) => {
       const message = error instanceof Error ? error.message : 'Payment failed.';
-      console.log('[TIPT-CS] Payment error:', message);
+      log('[TIPT-CS] Payment error:', message);
       window.dispatchEvent(new CustomEvent('mpp:payresponse', {
         detail: { requestId: detail.requestId, approved: false, error: message },
       }));
     });
-});
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'TIPT_PROMPT_402_PAYMENT') {
-    return;
-  }
-
-  console.log('[TIPT-CS] Prompt message received from background');
-  const payload = message.payload as {
-    host?: string;
-    invoice?: string;
-    method?: string;
-    url?: string;
-  };
-
-  const host = payload?.host ?? 'this site';
-  const method = payload?.method ?? 'GET';
-  const url = payload?.url ?? '';
-  const invoicePreview = payload?.invoice
-    ? `${payload.invoice.slice(0, 22)}...`
-    : 'No invoice provided';
-
-  console.log('[TIPT-CS] Showing user confirmation dialog for host:', host);
-  const approved = window.confirm(
-    `TIPT payment request (${host})\n\n${method} ${url}\n\nInvoice: ${invoicePreview}\n\nPay this 402 challenge now?`,
-  );
-
-  let remember = false;
-  if (approved) {
-    console.log('[TIPT-CS] User approved payment, asking about remember');
-    remember = window.confirm('Remember approval for this host and auto-approve next 402 payment requests?');
-  }
-  console.log('[TIPT-CS] User response - approved:', approved, 'remember:', remember);
-
-  sendResponse({ approved, remember });
-  return true;
 });

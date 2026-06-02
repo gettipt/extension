@@ -1,5 +1,8 @@
 // ── Crypto helpers (Web Crypto API) ───────────────────────────────────────
 
+export const PBKDF2_ITERATIONS_DEFAULT = 600_000;
+export const PBKDF2_ITERATIONS_LEGACY = 100_000;
+
 export function hexToBuf(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2)
@@ -13,7 +16,12 @@ export function bufToHex(buf: Uint8Array): string {
     .join('');
 }
 
-export async function deriveKey(pin: string, salt: Uint8Array): Promise<CryptoKey> {
+export async function deriveKey(
+  pin: string,
+  salt: Uint8Array,
+  iterations: number = PBKDF2_ITERATIONS_DEFAULT,
+  extractable: boolean = false,
+): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(pin),
@@ -22,10 +30,10 @@ export async function deriveKey(pin: string, salt: Uint8Array): Promise<CryptoKe
     ['deriveKey'],
   );
   return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: salt.buffer as ArrayBuffer, iterations: 100_000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: salt.buffer as ArrayBuffer, iterations, hash: 'SHA-256' },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
-    false,
+    extractable,
     ['encrypt', 'decrypt'],
   );
 }
@@ -54,4 +62,9 @@ export async function decryptText(
     hexToBuf(ct).buffer as ArrayBuffer,
   );
   return new TextDecoder().decode(plain);
+}
+
+// Generate a random AES-GCM session key (non-extractable).
+export async function generateSessionKey(): Promise<CryptoKey> {
+  return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }

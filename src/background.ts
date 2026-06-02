@@ -1,5 +1,7 @@
 /// <reference types="chrome" />
 
+import { log } from './lib/logger';
+
 // Background service worker.
 
 const GREEN_ICON = 'greenasterisk.png';
@@ -203,7 +205,7 @@ function buildAuthorizationValue(challenge: ChallengePayload, preimage: string):
     };
 
     const credentialJson = jcsStringify(credential);
-    console.log('[TIPT-BG] Payment credential JSON (JCS):', credentialJson);
+    log('[TIPT-BG] Payment credential JSON (JCS):', credentialJson);
     return `Payment ${toBase64UrlUtf8(credentialJson)}`;
   }
 
@@ -218,28 +220,46 @@ function buildAuthorizationValue(challenge: ChallengePayload, preimage: string):
   return `Bearer ${preimage}`;
 }
 
-function promptForPaymentApproval(tabId: number, payload: PayRequestPayload, host: string): Promise<PromptResponse> {
-  return new Promise((resolve) => {
-    chrome.tabs.sendMessage(
-      tabId,
-      {
-        type: 'TIPT_PROMPT_402_PAYMENT',
-        payload: {
-          host,
-          url: payload.url,
-          method: payload.method,
-          invoice: payload.challenge.invoice,
-        },
-      },
-      (response: PromptResponse) => {
-        if (chrome.runtime.lastError) {
-          resolve({ approved: false });
-          return;
-        }
+interface PendingConfirm {
+  details: { host: string; url: string; method: string; invoice: string };
+  resolve: (response: PromptResponse) => void;
+  timeoutId: ReturnType<typeof setTimeout>;
+}
 
-        resolve(response ?? { approved: false });
-      },
-    );
+const pendingConfirms = new Map<string, PendingConfirm>();
+const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
+
+function promptForPaymentApproval(_tabId: number, payload: PayRequestPayload, host: string): Promise<PromptResponse> {
+  return new Promise((resolve) => {
+    const id = crypto.randomUUID();
+    const details = {
+      host,
+      url: payload.url,
+      method: payload.method,
+      invoice: payload.challenge.invoice,
+    };
+    const timeoutId = setTimeout(() => {
+      const pending = pendingConfirms.get(id);
+      if (pending) {
+        pendingConfirms.delete(id);
+        pending.resolve({ approved: false });
+      }
+    }, CONFIRM_TIMEOUT_MS);
+    pendingConfirms.set(id, { details, resolve, timeoutId });
+    chrome.windows.create({
+      url: chrome.runtime.getURL(`confirm.html?id=${encodeURIComponent(id)}`),
+      type: 'popup',
+      width: 380,
+      height: 460,
+      focused: true,
+    }).catch(() => {
+      const pending = pendingConfirms.get(id);
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+        pendingConfirms.delete(id);
+        pending.resolve({ approved: false });
+      }
+    });
   });
 }
 
@@ -307,51 +327,51 @@ function requestPreimageFromOffscreen(
 }
 
 async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrome.runtime.MessageSender) {
-  console.log('[TIPT-BG] Handling 402 payment request');
+  log('[TIPT-BG] Handling 402 payment request');
   const invoice = getStringValue(payload?.challenge?.invoice);
   if (!invoice) {
-    console.log('[TIPT-BG] No invoice found in challenge');
+    log('[TIPT-BG] No invoice found in challenge');
     return { approved: false, error: 'No invoice found in 402 challenge.' };
   }
 
   const host = getHostFromUrl(payload.url);
   if (!host) {
-    console.log('[TIPT-BG] Failed to extract host from URL:', payload.url);
+    log('[TIPT-BG] Failed to extract host from URL:', payload.url);
     return { approved: false, error: 'Failed to resolve request host for 402 payment.' };
   }
 
-  console.log('[TIPT-BG] Processing 402 payment for host:', host);
+  log('[TIPT-BG] Processing 402 payment for host:', host);
   let approved = await isHostRemembered(host);
   let remember = false;
 
   if (!approved) {
-    console.log('[TIPT-BG] Host not remembered, prompting user');
+    log('[TIPT-BG] Host not remembered, prompting user');
     const tabId = sender.tab?.id;
     if (tabId === undefined) {
-      console.log('[TIPT-BG] No tab ID available for prompt');
+      log('[TIPT-BG] No tab ID available for prompt');
       return { approved: false, error: 'Cannot prompt for 402 payment approval in this context.' };
     }
 
     const prompt = await promptForPaymentApproval(tabId, payload, host);
     approved = !!prompt.approved;
     remember = !!prompt.remember;
-    console.log('[TIPT-BG] User prompt result - approved:', approved, 'remember:', remember);
+    log('[TIPT-BG] User prompt result - approved:', approved, 'remember:', remember);
   } else {
-    console.log('[TIPT-BG] Host is remembered, auto-approving');
+    log('[TIPT-BG] Host is remembered, auto-approving');
   }
 
   if (!approved) {
-    console.log('[TIPT-BG] Payment not approved, returning error');
+    log('[TIPT-BG] Payment not approved, returning error');
     return { approved: false, error: 'Payment was not approved.' };
   }
 
   if (remember) {
-    console.log('[TIPT-BG] Remembering host:', host);
+    log('[TIPT-BG] Remembering host:', host);
     await rememberHost(host);
   }
 
   try {
-    console.log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
+    log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
 
     // Read credentials in background (offscreen docs lack chrome.storage access).
     const sessionItems = await chrome.storage.session.get(['spark_session_pin']);
@@ -359,16 +379,19 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
     if (!sessionPin) {
       return { approved: false, error: 'Wallet is locked. Open TIPT and unlock first.' };
     }
+    const localItems = await chrome.storage.local.get(['spark_pin', 'spark_wallet']);
     const syncItems = await chrome.storage.sync.get(['spark_pin', 'spark_wallet']);
-    const pinRaw = typeof syncItems['spark_pin'] === 'string' ? syncItems['spark_pin'] : null;
-    const walletRaw = typeof syncItems['spark_wallet'] === 'string' ? syncItems['spark_wallet'] : null;
+    const pinRaw = typeof localItems['spark_pin'] === 'string' ? localItems['spark_pin']
+      : typeof syncItems['spark_pin'] === 'string' ? syncItems['spark_pin'] : null;
+    const walletRaw = typeof localItems['spark_wallet'] === 'string' ? localItems['spark_wallet']
+      : typeof syncItems['spark_wallet'] === 'string' ? syncItems['spark_wallet'] : null;
     if (!pinRaw || !walletRaw) {
       return { approved: false, error: 'Wallet data not found.' };
     }
 
     await ensureOffscreenDocument();
     const preimage = await requestPreimageFromOffscreen(invoice, sessionPin, pinRaw, walletRaw);
-    console.log('[TIPT-BG] Payment successful, preimage:', preimage, '(len:', preimage.length, ')');
+    log('[TIPT-BG] Payment successful, preimage:', preimage, '(len:', preimage.length, ')');
 
     const authorization = buildAuthorizationValue(payload.challenge, preimage);
     if (!authorization) {
@@ -381,14 +404,14 @@ async function handle402PaymentRequest(payload: PayRequestPayload, sender: chrom
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to pay invoice.';
-    console.log('[TIPT-BG] Payment failed:', message);
+    log('[TIPT-BG] Payment failed:', message);
     return { approved: false, error: message };
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === MPP_REQUEST_TRIGGERED_EVENT) {
-    console.log('[TIPT-BG] mpp:request listener trigger received');
+    log('[TIPT-BG] mpp:request listener trigger received');
     const tabId = sender.tab?.id;
     if (tabId !== undefined) {
       chrome.action.setIcon({ tabId, path: GREEN_ICON });
@@ -396,14 +419,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message?.type === 'TIPT_402_CONFIRM_READY') {
+    const id = message.payload?.id;
+    const pending = typeof id === 'string' ? pendingConfirms.get(id) : undefined;
+    if (!pending) {
+      sendResponse({ ok: false, error: 'Payment request not found or expired.' });
+      return;
+    }
+    sendResponse({ ok: true, details: pending.details });
+    return;
+  }
+
+  if (message?.type === 'TIPT_402_CONFIRM_RESPONSE') {
+    const id = message.payload?.id;
+    const approved = !!message.payload?.approved;
+    const remember = !!message.payload?.remember;
+    const pending = typeof id === 'string' ? pendingConfirms.get(id) : undefined;
+    if (pending) {
+      clearTimeout(pending.timeoutId);
+      pendingConfirms.delete(id);
+      pending.resolve({ approved, remember });
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+
   if (message?.type !== 'TIPT_402_PAY_REQUEST') {
     return;
   }
 
-  console.log('[TIPT-BG] Payment request message received from content script');
+  log('[TIPT-BG] Payment request message received from content script');
   const payload = message.payload as PayRequestPayload;
   void handle402PaymentRequest(payload, sender).then((response) => {
-    console.log('[TIPT-BG] Sending payment response:', response);
+    log('[TIPT-BG] Sending payment response:', response);
     sendResponse(response);
   });
 

@@ -18,6 +18,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         offscreen: path.resolve(__dirname, 'offscreen.html'),
+        confirm: path.resolve(__dirname, 'confirm.html'),
         background: path.resolve(__dirname, 'src/background.ts'),
         content: path.resolve(__dirname, 'src/content.ts'),
       },
