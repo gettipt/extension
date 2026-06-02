@@ -47,8 +47,8 @@ interface PayResponse {
 
 const announcement = {
   name: 'TIPT',
-  version: '0.0.0',
-  capabilities: ['l402', 'lightning-invoice'],
+  version: '0.0.1',
+  capabilities: ['charge'],
 };
 
 function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
