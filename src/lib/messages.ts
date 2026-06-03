@@ -25,6 +25,18 @@ export const MSG = {
   HAS_WALLET: 'TIPT_HAS_WALLET',
   DISPOSE_WALLET: 'TIPT_DISPOSE_WALLET',
   OFFSCREEN_PAY_INVOICE: 'TIPT_OFFSCREEN_PAY_INVOICE',
+  // Spark-native transfer to a Spark address (background → offscreen).
+  // Separate from OFFSCREEN_PAY_INVOICE because the SDK call is different
+  // (wallet.transfer vs wallet.payLightningInvoice) and there is no
+  // Lightning preimage to return — the response carries the Spark
+  // transfer id instead.
+  OFFSCREEN_SPARK_TRANSFER: 'TIPT_OFFSCREEN_SPARK_TRANSFER',
+  GET_SPARK_ADDRESS: 'TIPT_GET_SPARK_ADDRESS',
+  // Fire-and-forget warm-up: spin up the offscreen SparkWallet SDK ahead of
+  // any actual 402 confirm, so the user doesn't pay the cold-start cost on
+  // the critical path between clicking Approve and the page receiving its
+  // mpp:payResponse.
+  PREWARM_WALLET: 'TIPT_PREWARM_WALLET',
 
   // 402 / MPP background ops
   MPP_REQUEST_TRIGGERED: 'TIPT_MPP_REQUEST_TRIGGERED',

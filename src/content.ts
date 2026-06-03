@@ -24,7 +24,17 @@ const MAX_REQUEST_ID_LEN = 256;
 
 interface MppPayDetail {
   requestId: string;
+  // Payment target. Today this is either a BOLT11 Lightning invoice
+  // ("lnbc…") or a Spark address ("spark1…", "sp1…" etc.). The wire field
+  // is named `invoice` for back-compat with sites already integrating MPP;
+  // the meaning is generalised to "payment target". The background classifies
+  // by prefix (see src/lib/payment-target.ts) and routes accordingly.
   invoice: string;
+  // Required for Spark addresses (which have no embedded amount), ignored
+  // for BOLT11 invoices (amount is in the invoice HRP). When supplied for
+  // a Lightning invoice the background does not consult it — the BOLT11
+  // amount is always authoritative.
+  amountSats?: number;
   scheme?: string;
   macaroon?: string;
   token?: string;
@@ -48,8 +58,26 @@ interface PayResponse {
 const announcement = {
   name: 'TIPT',
   version: '0.0.1',
-  capabilities: ['charge'],
+  // 'charge' = pays a BOLT11 Lightning invoice; 'spark-transfer' = sends
+  // sats to a Spark address via wallet.transfer (off-Lightning settlement).
+  // Both flow through the same mpp:payRequest event — the extension picks
+  // the path from the prefix of the `invoice` field.
+  capabilities: ['charge', 'spark-transfer'],
 };
+
+// Cached result of the most recent background "is the wallet configured?"
+// check. Pages that fire `mpp:request` in rapid succession (or that the
+// throttle below short-circuits) get this cached value immediately rather
+// than waiting a second round-trip. `undefined` means "we haven't asked
+// the background yet" — surfaced to the page as `undefined` so consumers
+// can distinguish "unknown" from "definitely missing".
+let cachedWalletConfigured: boolean | undefined;
+
+function dispatchAnnouncement(): void {
+  window.dispatchEvent(new CustomEvent('mpp:response', {
+    detail: { ...announcement, walletConfigured: cachedWalletConfigured },
+  }));
+}
 
 function sendRuntimeMessage<T>(message: Record<string, unknown>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -87,24 +115,41 @@ function takePaymentChallenge(raw: unknown): MppPayDetail['paymentChallenge'] | 
 
 // Announce presence and notify background (icon badge) when the page asks.
 // Rate-limit so a hostile page cannot spam `mpp:request` and keep the SW
-// awake (background only sets an icon, so impact is small — but
-// defense-in-depth is cheap). 250ms is loose enough to feel instant on a
-// real page load and tight enough to throttle a tight dispatch loop.
+// awake. 250ms is loose enough to feel instant on a real page load and
+// tight enough to throttle a tight dispatch loop.
+//
+// Two announcements happen per "fresh" request:
+//   1. An immediate `mpp:response` carrying the cached `walletConfigured`
+//      value (possibly `undefined` on the very first request) so pages
+//      that listen with a `once: true` handler still receive a discovery
+//      response without waiting on a runtime hop.
+//   2. A second `mpp:response` after the background reports the current
+//      wallet-configured state. Pages that care about accuracy should
+//      listen for `mpp:response` continuously (not with `once: true`)
+//      and use the most recent payload.
 const MPP_REQUEST_THROTTLE_MS = 250;
 let lastMppRequestAt = 0;
 window.addEventListener('mpp:request', () => {
   const now = Date.now();
   if (now - lastMppRequestAt >= MPP_REQUEST_THROTTLE_MS) {
     lastMppRequestAt = now;
-    // Fire-and-forget — background only flips the toolbar icon. The
-    // `.catch` swallows the unhandled-rejection warning Chrome logs on the
-    // host page when the SW happens to be unreachable.
-    chrome.runtime.sendMessage({ type: MPP_REQUEST_TRIGGERED_EVENT }).catch(() => {});
+    sendRuntimeMessage<{ ok?: boolean; walletConfigured?: boolean }>({ type: MPP_REQUEST_TRIGGERED_EVENT })
+      .then((response) => {
+        if (response && typeof response.walletConfigured === 'boolean') {
+          const changed = cachedWalletConfigured !== response.walletConfigured;
+          cachedWalletConfigured = response.walletConfigured;
+          // Only re-announce when the state actually changed (or this is
+          // the first time we've learned it). Avoids a duplicate event on
+          // every page load once the cache is warm.
+          if (changed) dispatchAnnouncement();
+        }
+      })
+      .catch(() => { /* SW unreachable; the cached value (if any) stands. */ });
   }
   // The announcement is dispatched on the page (no runtime hop), so always
-  // respond — pages that just want to discover the wallet shouldn't be
-  // collateral damage of the throttle.
-  window.dispatchEvent(new CustomEvent('mpp:response', { detail: announcement }));
+  // respond immediately — pages that just want to discover the wallet
+  // shouldn't be collateral damage of the throttle or the runtime round-trip.
+  dispatchAnnouncement();
 });
 
 // Handle payment requests dispatched by the page.
@@ -122,6 +167,19 @@ window.addEventListener('mpp:payRequest', (event: Event) => {
   const token = takeBoundedString(detail.token, MAX_OPAQUE_LEN);
   const paymentChallenge = takePaymentChallenge(detail.paymentChallenge);
 
+  // Sanitise the optional amountSats. Validation that it's required (for
+  // Spark) and matches the target kind happens in the background — keeping
+  // the content script ignorant of payment-kind semantics keeps the
+  // page-side surface as small as possible.
+  let amountSats: number | undefined;
+  if (typeof detail.amountSats === 'number'
+    && Number.isFinite(detail.amountSats)
+    && Number.isInteger(detail.amountSats)
+    && detail.amountSats > 0
+    && detail.amountSats <= Number.MAX_SAFE_INTEGER) {
+    amountSats = detail.amountSats;
+  }
+
   log('[TIPT-CS] mpp:payRequest received, requestId:', requestId);
 
   void sendRuntimeMessage<PayResponse>({
@@ -133,6 +191,7 @@ window.addEventListener('mpp:payRequest', (event: Event) => {
       challenge: {
         scheme,
         invoice,
+        amountSats,
         macaroon,
         token,
         paymentChallenge,

@@ -5,6 +5,7 @@ import {
   pendingConfirmStorageKey,
   type PersistedConfirmDetails,
 } from './lib/confirm-protocol';
+import { paymentKindLabel } from './lib/payment-target';
 
 interface RespondPayload {
   approved: boolean;
@@ -19,6 +20,16 @@ function sanitiseSatsInput(raw: string): string {
 function formatSats(value: number | null): string {
   if (value === null) return 'Amount unspecified';
   return `${value.toLocaleString('en-US')} sats`;
+}
+
+// Truncate a long bech32m address ("spark1qq…xyz") to a glanceable form for
+// the confirm popup. We keep enough of the suffix that the user can compare
+// it against a recipient address shown elsewhere (e.g. an invoice they
+// generated themselves) without rendering the full ~70-char string and
+// blowing out the popup width.
+function truncateMiddle(value: string, head = 14, tail = 8): string {
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}…${value.slice(-tail)}`;
 }
 
 // Resize the confirm popup's chrome window so its inner content area
@@ -197,6 +208,26 @@ export default function ConfirmApp() {
         <>
           <div className="rounded-xl bg-neutral-100 dark:bg-neutral-900 p-3 space-y-2 text-xs">
             <div>
+              <div className="text-neutral-500 dark:text-neutral-400">Method</div>
+              <div className="flex items-center gap-1.5">
+                <span
+                  className={`inline-block w-1.5 h-1.5 rounded-full ${
+                    (details.paymentKind ?? 'lightning') === 'spark'
+                      ? 'bg-purple-500'
+                      : 'bg-amber-500'
+                  }`}
+                />
+                <span className="font-semibold">
+                  {paymentKindLabel(details.paymentKind ?? 'lightning')}
+                </span>
+                <span className="text-neutral-500 dark:text-neutral-400">
+                  {(details.paymentKind ?? 'lightning') === 'spark'
+                    ? '— off-Lightning transfer'
+                    : '— BOLT11 invoice'}
+                </span>
+              </div>
+            </div>
+            <div>
               <div className="text-neutral-500 dark:text-neutral-400">Site</div>
               <div className="font-mono break-all">{details.host}</div>
             </div>
@@ -204,6 +235,14 @@ export default function ConfirmApp() {
               <div className="text-neutral-500 dark:text-neutral-400">Amount</div>
               <div className="font-mono">{formatSats(details.amountSats)}</div>
             </div>
+            {(details.paymentKind ?? 'lightning') === 'spark' && (
+              <div>
+                <div className="text-neutral-500 dark:text-neutral-400">Recipient</div>
+                <div className="font-mono" title={details.invoice}>
+                  {truncateMiddle(details.invoice)}
+                </div>
+              </div>
+            )}
           </div>
 
           <label className={`flex items-center gap-2 text-xs ${canRemember ? 'text-neutral-700 dark:text-neutral-300' : 'text-neutral-400 dark:text-neutral-600'}`}>

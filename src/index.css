@@ -4,6 +4,7 @@ html,
 body {
   margin: 0;
   width: 324px;
+  min-width: 324px;
   color: #171717;
   font-family: system-ui, -apple-system, sans-serif;
   color-scheme: light dark;
@@ -13,12 +14,32 @@ body {
   width: 324px;
 }
 
+/* On larger viewports (full tab/windows), center the wallet card. */
+@media (min-width: 640px) and (min-height: 500px) {
+  html:has(#root),
+  body:has(#root) {
+    width: auto;
+  }
+
+  body:has(#root) {
+    min-height: 100dvh;
+    display: grid;
+    place-items: center;
+  }
+}
+
 /* Confirm popup window (confirm.html) sizes itself to its content via
    chrome.windows.update, so the body must not be locked to the main
    popup's 324px width. */
 body:has(#confirm-root),
 html:has(#confirm-root) {
   width: auto;
+  min-width: 0;
+}
+
+body:has(#confirm-root) {
+  min-height: auto;
+  display: block;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -26,4 +47,22 @@ html:has(#confirm-root) {
   body {
     color: #fafafa;
   }
+}
+
+/* Settings dropdown enter animation. Origin top-right anchors the scale
+   so it pops out from under the gear button rather than from the centre. */
+@keyframes tipt-menu-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.tipt-menu-pop {
+  animation: tipt-menu-pop 120ms ease-out;
+  transform-origin: top right;
 }

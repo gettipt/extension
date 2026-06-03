@@ -1,5 +1,6 @@
 /// <reference types="chrome" />
 import { useCallback, useEffect, useState } from 'react';
+import { FaXmark } from 'react-icons/fa6';
 import type { AllowlistEntry } from '../lib/allowlist';
 import { MSG } from '../lib/messages';
 import { Spinner } from './Spinner';
@@ -105,12 +106,17 @@ export function TrustedSitesScreen({ onBack }: TrustedSitesScreenProps) {
   return (
     <div className="flex flex-col flex-1 space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-neutral-900 dark:text-white">Trusted Sites</h2>
+        <div className="flex items-center gap-2">
+          <img src="/tiptgreen.svg" alt="TIPT" className="w-7 h-7" />
+          <h1 className="text-lg font-bold text-neutral-900 dark:text-neutral-200">TRUSTED SITES</h1>
+        </div>
         <button
           onClick={onBack}
-          className="text-xs text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white"
+          title="Back"
+          aria-label="Back"
+          className="p-1.5 rounded-lg transition-colors text-neutral-500 hover:text-neutral-900 hover:bg-neutral-200 dark:text-neutral-400 dark:hover:text-neutral-100 dark:hover:bg-neutral-800"
         >
-          Back
+          <FaXmark className="w-4 h-4" />
         </button>
       </div>
 

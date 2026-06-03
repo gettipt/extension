@@ -44,8 +44,9 @@ export type VerifyPinResult =
 // initial unlock screen and the in-app re-prompt modal use this. Encapsulates
 // the lockout check, salt + iterations lookup, key derivation, SENTINEL
 // decryption, and attempt-counter book-keeping — all of which were
-// duplicated in App.handlePinUnlock and PinPromptModal.verify before this
-// extraction, and which had drifted out of sync (the modal didn't update
+// duplicated in App.handlePinUnlock and the old inline/action PIN flows
+// before this extraction, and which had drifted out of sync (the action
+// flow didn't update
 // the lockout counter on a wrong-PIN salt/verifier shape mismatch).
 export async function verifyPin(pin: string): Promise<VerifyPinResult> {
   if (pin.length < PIN_LENGTH) return { ok: false, reason: 'too-short' };

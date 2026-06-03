@@ -123,6 +123,9 @@
 
     .status-text { font-size: 13px; color: var(--cp-text-soft); }
     .status-caps { font-size: 11px; color: var(--cp-text-muted); margin-top: 2px; font-family: Consolas, "Courier New", monospace; }
+    .status-wallet { font-size: 11px; margin-top: 2px; color: var(--cp-text-muted); }
+    .status-wallet.configured { color: var(--cp-success); }
+    .status-wallet.unconfigured { color: var(--cp-warning); }
 
     .form-grid {
       display: grid;
@@ -246,6 +249,26 @@
       margin-top: 6px;
       min-height: 16px;
     }
+
+    .kind-hint {
+      font-size: 11px;
+      color: var(--cp-text-muted);
+      margin-top: 2px;
+      font-family: Consolas, "Courier New", monospace;
+      min-height: 16px;
+    }
+    .kind-hint .kind-name { color: var(--cp-text); font-weight: 600; }
+    .kind-hint.bolt11 .kind-name { color: var(--cp-warning); }
+    .kind-hint.spark  .kind-name { color: var(--cp-link); }
+    .kind-hint.lnurl  .kind-name,
+    .kind-hint.address .kind-name { color: var(--cp-success); }
+    .kind-hint.invalid .kind-name { color: var(--cp-danger); }
+
+    /* Hide the amount field row entirely when the recipient is a raw
+       BOLT11 invoice — the amount is embedded and a payer-supplied value
+       would be discarded by the extension anyway. */
+    .form-grid.no-amount #amountLabel,
+    .form-grid.no-amount #amount { display: none; }
   </style>
 </head>
 <body>
@@ -260,6 +283,7 @@
       <div>
         <div class="status-text" id="statusText">Waiting for TIPT…</div>
         <div class="status-caps" id="statusCaps"></div>
+        <div class="status-wallet" id="statusWallet"></div>
       </div>
     </div>
   </div>
@@ -268,11 +292,18 @@
   <div class="card">
     <div class="card-title">Request Payment</div>
     <div class="form-grid">
-      <label for="lnurl">Recipient</label>
-      <input id="lnurl" type="text" placeholder="user@domain.com or lnurl1…" />
-      <label for="amount">&#8383;</label>
+      <label for="recipient">Recipient</label>
+      <input
+        id="recipient"
+        type="text"
+        placeholder="user@host.com, lnurl1…, lnbc…, or spark1…"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <label for="amount" id="amountLabel">&#8383;</label>
       <input id="amount" type="number" min="1" placeholder="Amount in sats" />
     </div>
+    <div class="kind-hint" id="kindHint">Detected: —</div>
     <div class="error-msg" id="formError"></div>
     <button id="payBtn" disabled>Pay via TIPT</button>
   </div>
@@ -348,6 +379,39 @@
       return new TextDecoder().decode(new Uint8Array(fromWords(words)));
     }
 
+    // ── Recipient classification ──────────────────────────────────────────────
+    // Mirror src/lib/payment-target.ts in the extension so the demo's UI
+    // hint matches what the extension will actually do. The extension is
+    // the source of truth for routing — this is purely a UX preview.
+    const SPARK_PREFIXES = [
+      'spark1', 'sparkt1', 'sparkrt1', 'sparks1', 'sparkl1',
+      'sp1', 'spt1', 'sprt1', 'sps1', 'spl1',
+    ];
+    const BOLT11_PREFIX_RE = /^ln(bc|tb|tbs|bcrt)/i;
+    const LIGHTNING_ADDRESS_RE = /^[a-z0-9._-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+
+    function classifyRecipient(raw) {
+      const v = (raw || '').trim();
+      if (!v) return { kind: 'empty' };
+      const lower = v.toLowerCase();
+      if (BOLT11_PREFIX_RE.test(lower)) return { kind: 'bolt11', value: v };
+      for (const p of SPARK_PREFIXES) {
+        if (lower.startsWith(p) && lower.length > p.length) return { kind: 'spark', value: v };
+      }
+      if (lower.startsWith('lnurl1')) return { kind: 'lnurl', value: v };
+      if (LIGHTNING_ADDRESS_RE.test(v)) return { kind: 'address', value: v };
+      return { kind: 'invalid', value: v };
+    }
+
+    const KIND_LABEL = {
+      bolt11: 'BOLT11 invoice (Lightning, amount embedded)',
+      spark: 'Spark address (requires amount)',
+      lnurl: 'LNURL (will resolve to BOLT11)',
+      address: 'Lightning Address (will resolve to BOLT11)',
+      invalid: 'Unrecognised — try a Lightning Address, LNURL, BOLT11, or Spark address',
+      empty: '—',
+    };
+
     // ── LNURL resolution ──────────────────────────────────────────────────────
     async function resolveToUrl(input) {
       input = input.trim();
@@ -406,65 +470,135 @@
     }
 
     // ── Wallet status ─────────────────────────────────────────────────────────
+    let walletReady = false;
     window.addEventListener('mpp:response', (e) => {
       const detail = e.detail || {};
+      walletReady = true;
       document.getElementById('statusDot').className = 'status-dot detected';
       document.getElementById('statusText').textContent = `${detail.name || 'Wallet'} detected (v${detail.version || '?'})`;
       document.getElementById('statusCaps').textContent = (detail.capabilities || []).join(', ');
-      document.getElementById('payBtn').disabled = false;
-      logEvent('mpp:response', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}]`);
+      const walletEl = document.getElementById('statusWallet');
+      if (detail.walletConfigured === true) {
+        walletEl.className = 'status-wallet configured';
+        walletEl.textContent = 'Wallet configured';
+      } else if (detail.walletConfigured === false) {
+        walletEl.className = 'status-wallet unconfigured';
+        walletEl.textContent = 'No wallet configured — open the TIPT extension to create or restore one';
+      } else {
+        walletEl.className = 'status-wallet';
+        walletEl.textContent = 'Wallet status unknown';
+      }
+      refreshPayButton();
+      logEvent('mpp:response', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}], walletConfigured=${detail.walletConfigured}`);
     });
 
     // Request announcement on load
     logEvent('mpp:request', 'dispatched on page load');
     window.dispatchEvent(new CustomEvent('mpp:request'));
 
+    // ── Live recipient classification + form gating ───────────────────────────
+    const recipientInput = document.getElementById('recipient');
+    const amountInput = document.getElementById('amount');
+    const formGrid = document.querySelector('.form-grid');
+    const kindHint = document.getElementById('kindHint');
+    const payBtn = document.getElementById('payBtn');
+
+    function refreshPayButton() {
+      const cls = classifyRecipient(recipientInput.value);
+      // BOLT11 has an embedded amount, so the amount field is suppressed
+      // and the button is enabled as soon as the recipient parses. Every
+      // other kind requires a positive amount.
+      const amtOk = cls.kind === 'bolt11'
+        || (Number.isFinite(parseInt(amountInput.value, 10)) && parseInt(amountInput.value, 10) > 0);
+      const kindOk = cls.kind === 'bolt11' || cls.kind === 'spark' || cls.kind === 'lnurl' || cls.kind === 'address';
+      payBtn.disabled = !(walletReady && kindOk && amtOk);
+    }
+
+    function refreshKindHint() {
+      const cls = classifyRecipient(recipientInput.value);
+      kindHint.className = `kind-hint ${cls.kind}`;
+      kindHint.innerHTML = `Detected: <span class="kind-name">${KIND_LABEL[cls.kind]}</span>`;
+      formGrid.classList.toggle('no-amount', cls.kind === 'bolt11');
+      refreshPayButton();
+    }
+
+    recipientInput.addEventListener('input', refreshKindHint);
+    amountInput.addEventListener('input', refreshPayButton);
+    refreshKindHint();
+
     // ── Pay button ─────────────────────────────────────────────────────────────
-    document.getElementById('payBtn').addEventListener('click', async () => {
+    payBtn.addEventListener('click', async () => {
       setFormError('');
-      const lnurlInput = document.getElementById('lnurl').value.trim();
-      const amountSats = parseInt(document.getElementById('amount').value, 10);
+      const rawRecipient = recipientInput.value.trim();
+      const amountSatsRaw = parseInt(amountInput.value, 10);
+      const cls = classifyRecipient(rawRecipient);
 
-      if (!lnurlInput) { setFormError('Enter a Lightning Address or LNURL.'); return; }
-      if (!amountSats || amountSats <= 0) { setFormError('Enter a valid amount.'); return; }
+      if (cls.kind === 'empty' || cls.kind === 'invalid') {
+        setFormError('Enter a Lightning Address, LNURL, BOLT11 invoice, or Spark address.');
+        return;
+      }
+      const needsAmount = cls.kind !== 'bolt11';
+      if (needsAmount && (!Number.isFinite(amountSatsRaw) || amountSatsRaw <= 0)) {
+        setFormError('Enter a valid amount in sats.');
+        return;
+      }
 
-      const btn = document.getElementById('payBtn');
-      btn.disabled = true;
-      btn.textContent = 'Resolving…';
+      payBtn.disabled = true;
+      payBtn.textContent = 'Preparing…';
 
       // Hide previous response
       document.getElementById('responseEmpty').style.display = 'none';
       document.getElementById('responseBox').style.display = 'none';
 
-      let invoice;
+      // Build the mpp:payRequest detail. `target` is what the extension
+      // sees in the `invoice` wire field — a BOLT11 invoice or a Spark
+      // address. For Lightning Address / LNURL we resolve to a BOLT11
+      // invoice up-front. For Spark we pass the address through and
+      // include `amountSats`.
+      let target;
+      let amountSatsForRequest;
+      let schemeForRequest = 'L402';
+
       try {
-        logEvent('lnurl', `resolving ${lnurlInput}`);
-        const payInfo = await resolveLnurl(lnurlInput);
-        const minSats = Math.ceil(payInfo.minSendable / 1000);
-        const maxSats = Math.floor(payInfo.maxSendable / 1000);
-        if (amountSats < minSats) { throw new Error(`Minimum is ${minSats} sats.`); }
-        if (amountSats > maxSats) { throw new Error(`Maximum is ${maxSats} sats.`); }
-        logEvent('lnurl', `fetching invoice for ${amountSats} sats`);
-        invoice = await fetchInvoice(payInfo.callback, amountSats * 1000);
-        logEvent('lnurl', `invoice: ${invoice.slice(0, 24)}…`);
+        if (cls.kind === 'bolt11') {
+          target = rawRecipient;
+        } else if (cls.kind === 'spark') {
+          target = rawRecipient;
+          amountSatsForRequest = amountSatsRaw;
+          schemeForRequest = 'SparkTransfer';
+        } else {
+          // Lightning Address or LNURL — resolve and fetch invoice.
+          logEvent('lnurl', `resolving ${rawRecipient}`);
+          payBtn.textContent = 'Resolving…';
+          const payInfo = await resolveLnurl(rawRecipient);
+          const minSats = Math.ceil(payInfo.minSendable / 1000);
+          const maxSats = Math.floor(payInfo.maxSendable / 1000);
+          if (amountSatsRaw < minSats) throw new Error(`Minimum is ${minSats} sats.`);
+          if (amountSatsRaw > maxSats) throw new Error(`Maximum is ${maxSats} sats.`);
+          logEvent('lnurl', `fetching invoice for ${amountSatsRaw} sats`);
+          target = await fetchInvoice(payInfo.callback, amountSatsRaw * 1000);
+          logEvent('lnurl', `invoice: ${target.slice(0, 24)}…`);
+        }
       } catch (err) {
         setFormError(err.message);
-        btn.disabled = false;
-        btn.textContent = 'Pay via TIPT';
+        payBtn.disabled = false;
+        payBtn.textContent = 'Pay via TIPT';
+        refreshPayButton();
         return;
       }
 
       const requestId = crypto.randomUUID();
-      logEvent('mpp:payRequest', `requestId=${requestId.slice(0, 8)}…`);
-      btn.textContent = 'Waiting for TIPT…';
+      logEvent('mpp:payRequest', `requestId=${requestId.slice(0, 8)}…, kind=${cls.kind}`);
+      payBtn.textContent = 'Waiting for TIPT…';
 
-      window.dispatchEvent(new CustomEvent('mpp:payRequest', {
-        detail: {
-          requestId,
-          invoice,
-          scheme: 'L402',
-        }
-      }));
+      const detail = {
+        requestId,
+        invoice: target,
+        scheme: schemeForRequest,
+      };
+      if (amountSatsForRequest !== undefined) detail.amountSats = amountSatsForRequest;
+
+      window.dispatchEvent(new CustomEvent('mpp:payRequest', { detail }));
 
       // One-time response listener
       function onResponse(e) {
@@ -486,8 +620,8 @@
         document.getElementById('responseJson').textContent = JSON.stringify(d, null, 2);
         document.getElementById('responseBox').style.display = 'block';
 
-        btn.disabled = false;
-        btn.textContent = 'Pay via TIPT';
+        payBtn.textContent = 'Pay via TIPT';
+        refreshPayButton();
       }
 
       window.addEventListener('mpp:payResponse', onResponse);
@@ -495,10 +629,10 @@
       // Timeout if no response in 90s
       setTimeout(() => {
         window.removeEventListener('mpp:payResponse', onResponse);
-        if (btn.textContent === 'Waiting for TIPT…') {
+        if (payBtn.textContent === 'Waiting for TIPT…') {
           setFormError('No response from TIPT after 90 seconds.');
-          btn.disabled = false;
-          btn.textContent = 'Pay via TIPT';
+          payBtn.textContent = 'Pay via TIPT';
+          refreshPayButton();
         }
       }, 90_000);
     });

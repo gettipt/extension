@@ -14,6 +14,7 @@ import { WALLET_KEY } from './constants';
 import { decodeBolt11AmountSats } from './lib/bolt11';
 import { MSG } from './lib/messages';
 import { scrubLegacyState } from './lib/migrate-legacy';
+import { classifyPaymentTarget, type PaymentKind } from './lib/payment-target';
 import {
   tryAutoApprove,
   rememberHost,
@@ -29,6 +30,12 @@ import {
 // Background service worker.
 
 const GREEN_ICON = 'greenasterisk.png';
+// "Wallet not configured" attention badge — drawn on top of the green icon
+// as an orange dot/exclamation when the page asks for a wallet but the user
+// hasn't created/restored one yet. The badge text is a single character
+// because Chrome truncates anything longer to fit the small badge area.
+const ATTENTION_BADGE_TEXT = '!';
+const ATTENTION_BADGE_COLOR = '#f59e0b';
 const ALARM_PREFIX = 'tipt-confirm-';
 const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -43,6 +50,14 @@ const CONFIRM_TIMEOUT_MS = 5 * 60 * 1000;
 const CONFIRM_POPUP_WIDTH = 380;
 const CONFIRM_POPUP_HEIGHT = 320;
 const CONFIRM_POPUP_MARGIN = 16;
+
+// Wallet-setup popup geometry. When a 402 arrives but the user has no wallet
+// yet, we open the main extension UI (index.html) so they can create/restore
+// one before the payment approval continues. index.css locks the body to
+// 324px, so 360px gives a little window chrome without a horizontal
+// scrollbar; the height is generous enough for the onboarding screens.
+const WALLET_SETUP_POPUP_WIDTH = 360;
+const WALLET_SETUP_POPUP_HEIGHT = 600;
 
 async function getConfirmPopupTopRight(): Promise<{ left: number; top: number } | null> {
   // chrome.windows.getLastFocused returns the most recently focused window
@@ -104,6 +119,12 @@ interface OffscreenPayResponse {
   error?: string;
 }
 
+interface OffscreenSparkTransferResponse {
+  ok: boolean;
+  txId?: string;
+  error?: string;
+}
+
 function getHostFromUrl(rawUrl: string): string | null {
   try {
     return new URL(rawUrl).host;
@@ -130,6 +151,24 @@ chrome.runtime.onStartup.addListener(() => {
   scrubLegacyState();
 });
 
+// Open onboarding immediately after first install so users can configure a
+// wallet before they ever hit a paywalled request.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason !== 'install') return;
+  void (async () => {
+    try {
+      const existing = await getSynced(WALLET_KEY);
+      if (typeof existing === 'string' && existing.length > 0) return;
+      await chrome.tabs.create({
+        url: chrome.runtime.getURL('index.html'),
+        active: true,
+      });
+    } catch (err) {
+      log('[TIPT-BG] Failed to open onboarding tab on install:', err);
+    }
+  })();
+});
+
 // ---------------------------------------------------------------------------
 // 402 error sanitisation
 // ---------------------------------------------------------------------------
@@ -148,9 +187,12 @@ function sanitise402Error(raw: string | undefined): Mpp402ErrorCode {
   if (
     s.includes('wallet data not found')
     || s.includes('wallet not initialized')
+    || s.includes('wallet setup was not completed')
     || s.includes('cannot prompt')
     || s.includes('failed to resolve request host')
     || s.includes('no invoice found')
+    || s.includes('not a recognised lightning invoice or spark address')
+    || s.includes('spark transfers require')
     || s.includes('missing payment challenge fields')
   ) return 'unavailable';
   return 'failed';
@@ -175,6 +217,22 @@ function validate402Payload(payload: unknown): PayRequestPayload | null {
   const scheme = typeof ch.scheme === 'string' ? ch.scheme : '';
   if (scheme.length > MAX_SHORT_FIELD_LEN) return null;
   if (typeof ch.invoice !== 'string' || ch.invoice.length === 0 || ch.invoice.length > MAX_INVOICE_LEN) return null;
+  // Optional payer-supplied amount. Required for Spark transfers (no
+  // amount embedded in a Spark address); ignored when present alongside a
+  // BOLT11 invoice (the HRP amount is always authoritative for Lightning).
+  // Validation is strict on both shape and range — reject anything that
+  // wouldn't safely flow through the allowlist sats arithmetic.
+  let challengeAmountSats: number | undefined;
+  if (ch.amountSats !== undefined) {
+    if (typeof ch.amountSats !== 'number'
+      || !Number.isFinite(ch.amountSats)
+      || !Number.isInteger(ch.amountSats)
+      || ch.amountSats <= 0
+      || ch.amountSats > Number.MAX_SAFE_INTEGER) {
+      return null;
+    }
+    challengeAmountSats = ch.amountSats;
+  }
   if (ch.macaroon !== undefined && (typeof ch.macaroon !== 'string' || ch.macaroon.length > MAX_OPAQUE_LEN)) return null;
   if (ch.token !== undefined && (typeof ch.token !== 'string' || ch.token.length > MAX_OPAQUE_LEN)) return null;
   if (ch.rawHeader !== undefined && (typeof ch.rawHeader !== 'string' || ch.rawHeader.length > MAX_OPAQUE_LEN)) return null;
@@ -208,6 +266,7 @@ function validate402Payload(payload: unknown): PayRequestPayload | null {
     challenge: {
       scheme,
       invoice: ch.invoice,
+      amountSats: challengeAmountSats,
       rawHeader: ch.rawHeader as string | undefined,
       macaroon: ch.macaroon as string | undefined,
       token: ch.token as string | undefined,
@@ -270,6 +329,7 @@ function promptForPaymentApproval(
   payload: PayRequestPayload,
   host: string,
   amountSats: number | null,
+  paymentKind: PaymentKind,
 ): Promise<PromptResponse> {
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
@@ -281,6 +341,7 @@ function promptForPaymentApproval(
       invoice: payload.challenge.invoice,
       amountSats,
       expiresAt,
+      paymentKind: paymentKind === 'unknown' ? 'lightning' : paymentKind,
     };
     pendingConfirms.set(id, { resolve, host });
     hostsWithPendingConfirm.add(host);
@@ -355,7 +416,130 @@ function requestPreimageFromOffscreen(invoice: string, walletRaw: string): Promi
   });
 }
 
+// Mirrors `requestPreimageFromOffscreen` but for Spark-native transfers.
+// Returns the Spark transfer id (WalletTransfer.id) — there's no Lightning
+// preimage on this path. The id is purely informational for the demo; real
+// integrators would treat it as an opaque receipt.
+function requestSparkTransferFromOffscreen(
+  receiverSparkAddress: string,
+  amountSats: number,
+  walletRaw: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        type: MSG.OFFSCREEN_SPARK_TRANSFER,
+        payload: { receiverSparkAddress, amountSats, walletRaw },
+      },
+      (response: OffscreenSparkTransferResponse) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (!response?.ok || !response.txId) {
+          reject(new Error(response?.error ?? 'Offscreen Spark transfer failed.'));
+          return;
+        }
+        resolve(response.txId);
+      },
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Wallet-setup gate
+// ---------------------------------------------------------------------------
+// When a 402 payment arrives but the user hasn't created or restored a wallet
+// yet, open the main extension UI (index.html) as a popup so they can set one
+// up, then continue the payment approval flow once the encrypted wallet blob
+// lands in chrome.storage. Reuses the confirm popup's 5-minute budget and
+// top-right anchoring.
+
+// Collapses concurrent no-wallet 402 requests onto a single setup window and
+// a shared completion promise, so a page firing several payRequests doesn't
+// spawn a stack of onboarding windows.
+let walletSetupWait: Promise<boolean> | null = null;
+
+async function ensureWalletConfigured(): Promise<boolean> {
+  const existing = await getSynced(WALLET_KEY);
+  if (typeof existing === 'string' && existing.length > 0) return true;
+  if (!walletSetupWait) {
+    walletSetupWait = openWalletSetupAndWait().finally(() => { walletSetupWait = null; });
+  }
+  return walletSetupWait;
+}
+
+function openWalletSetupAndWait(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let setupWindowId: number | undefined;
+
+    const finish = (configured: boolean, closeWindow: boolean) => {
+      if (settled) return;
+      settled = true;
+      chrome.storage.onChanged.removeListener(onStorageChanged);
+      chrome.windows.onRemoved.removeListener(onWindowRemoved);
+      clearTimeout(timer);
+      if (closeWindow && typeof setupWindowId === 'number') {
+        chrome.windows.remove(setupWindowId).catch(() => { /* already gone */ });
+      }
+      resolve(configured);
+    };
+
+    // The wallet blob is written via setItemDual → chrome.storage.local (and
+    // best-effort sync). Either area landing the key means setup completed.
+    const onStorageChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      areaName: string,
+    ) => {
+      if (areaName !== 'local' && areaName !== 'sync') return;
+      const change = changes[WALLET_KEY];
+      if (change && typeof change.newValue === 'string' && change.newValue.length > 0) {
+        finish(true, true);
+      }
+    };
+
+    const onWindowRemoved = (windowId: number) => {
+      if (windowId !== setupWindowId) return;
+      // User closed the setup window. Re-read storage in case the write raced
+      // the close; otherwise treat it as "setup not completed".
+      void getSynced(WALLET_KEY).then((w) => {
+        finish(typeof w === 'string' && w.length > 0, false);
+      });
+    };
+
+    const timer = setTimeout(() => finish(false, true), CONFIRM_TIMEOUT_MS);
+
+    chrome.storage.onChanged.addListener(onStorageChanged);
+    chrome.windows.onRemoved.addListener(onWindowRemoved);
+
+    void (async () => {
+      try {
+        const coords = await getConfirmPopupTopRight();
+        const win = await chrome.windows.create({
+          url: chrome.runtime.getURL('index.html'),
+          type: 'popup',
+          width: WALLET_SETUP_POPUP_WIDTH,
+          height: WALLET_SETUP_POPUP_HEIGHT,
+          focused: true,
+          ...(coords ?? {}),
+        });
+        setupWindowId = win?.id;
+        // The wallet may have been created between our initial check and the
+        // window opening (e.g. the user already had the popup open). Re-check
+        // so we don't strand them on a redundant setup window.
+        const w = await getSynced(WALLET_KEY);
+        if (typeof w === 'string' && w.length > 0) finish(true, true);
+      } catch (err) {
+        log('[TIPT-BG] Failed to open wallet setup popup:', err);
+        finish(false, false);
+      }
+    })();
+  });
+}
+
 async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runtime.MessageSender) {
+  const tEnter = Date.now();
   log('[TIPT-BG] Handling 402 payment request');
   const payload = validate402Payload(rawPayload);
   if (!payload) {
@@ -366,6 +550,16 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
   if (!invoice) {
     log('[TIPT-BG] No invoice found in challenge');
     return { approved: false, error: 'No invoice found in 402 challenge.' };
+  }
+
+  // Classify Lightning vs Spark up-front so all downstream logic (amount
+  // resolution, prompt UI, payment routing, authorization shape) shares
+  // a single branch decision. Unknown prefixes fail closed — we never
+  // try to "guess" which SDK call to use.
+  const paymentKind = classifyPaymentTarget(invoice);
+  if (paymentKind === 'unknown') {
+    log('[TIPT-BG] Payment target not recognised as Lightning or Spark');
+    return { approved: false, error: 'Payment target is not a recognised Lightning invoice or Spark address.' };
   }
 
   // SECURITY: derive the host from `sender.url` (or `sender.tab?.url`),
@@ -380,14 +574,57 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
     return { approved: false, error: 'Failed to resolve request host for 402 payment.' };
   }
 
-  log('[TIPT-BG] Processing 402 payment for host:', host);
-  const amountSats = decodeBolt11AmountSats(invoice);
+  log('[TIPT-BG] Processing 402 payment for host:', host, 'kind:', paymentKind);
+  // Fire-and-forget prewarm of the offscreen + SparkWallet SDK while the
+  // user reads the confirm popup (or while auto-approve runs). Idempotent;
+  // safe to call on the auto-approve path too — the offscreen short-circuits
+  // when `cachedWallet` already exists, so the cost is one IPC round-trip.
+  prewarmWallet();
+
+  // Amount resolution differs by kind:
+  //   * Lightning: BOLT11 amount is authoritative (any payer-supplied
+  //     amountSats is ignored — the invoice signs the amount).
+  //   * Spark:     no embedded amount, so the payer MUST supply one. We
+  //     reject the request otherwise rather than silently prompting with
+  //     "Amount unspecified" — for Spark a missing amount means we have
+  //     no way to enforce caps or to call wallet.transfer.
+  let amountSats: number | null;
+  if (paymentKind === 'lightning') {
+    amountSats = decodeBolt11AmountSats(invoice);
+  } else {
+    const supplied = payload.challenge.amountSats;
+    if (typeof supplied !== 'number' || supplied <= 0) {
+      log('[TIPT-BG] Spark transfer missing required amountSats');
+      return { approved: false, error: 'Spark transfers require a positive amountSats in the payment request.' };
+    }
+    amountSats = supplied;
+  }
+
+  // Wallet-existence gate. If the user hasn't set up a wallet yet, open the
+  // onboarding UI and wait for them to create or restore one before going any
+  // further. This deliberately precedes tryAutoApprove: a host the user
+  // previously allowlisted must not silently "auto-approve" into a payment we
+  // cannot fulfil — we'd only discover the missing wallet at pay time and
+  // bounce back an opaque failure. Gating here also lets the brand-new wallet
+  // continue straight into the normal confirm/auto-approve flow.
+  const walletReady = await ensureWalletConfigured();
+  if (!walletReady) {
+    log('[TIPT-BG] Wallet setup not completed; aborting 402 payment');
+    return { approved: false, error: 'Wallet setup was not completed.' };
+  }
+  // The wallet may have just been created — kick off prewarm now that there's
+  // something to initialise. The earlier prewarm call no-ops when no wallet
+  // exists, and prewarmWallet is idempotent, so this is safe in both paths.
+  prewarmWallet();
+
   const auto = await tryAutoApprove(host, amountSats);
-  log('[TIPT-BG] Auto-approve decision:', auto, 'amount:', amountSats);
+  const tAutoDecided = Date.now();
+  log('[TIPT-BG] Auto-approve decision:', auto, 'amount:', amountSats, `(t+${tAutoDecided - tEnter} ms)`);
 
   let approved = auto.approved;
   let remember = false;
   let caps: { maxSatsPerPayment: number; maxSatsPerDay: number } | undefined;
+  let tPromptResolved = tAutoDecided;
 
   if (!approved) {
     if (sender.tab?.id === undefined) {
@@ -405,11 +642,15 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
       return { approved: false, error: 'A previous payment approval is still pending for this site.' };
     }
 
-    const prompt = await promptForPaymentApproval(payload, host, amountSats);
+    const prompt = await promptForPaymentApproval(payload, host, amountSats, paymentKind);
     approved = !!prompt.approved;
     remember = !!prompt.remember;
     caps = prompt.caps;
-    log('[TIPT-BG] User prompt result - approved:', approved, 'remember:', remember);
+    tPromptResolved = Date.now();
+    log(
+      '[TIPT-BG] User prompt result - approved:', approved, 'remember:', remember,
+      `(user reaction t+${tPromptResolved - tAutoDecided} ms)`,
+    );
   }
 
   if (!approved) {
@@ -431,8 +672,6 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
   }
 
   try {
-    log('[TIPT-BG] Paying invoice:', invoice.slice(0, 20));
-
     // Background can read chrome.storage; the offscreen cannot. Pass the
     // encrypted wallet blob along so the offscreen can re-initialise its
     // SDK instance if Chrome reclaimed the offscreen document. The PIN
@@ -443,21 +682,115 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
       return { approved: false, error: 'Wallet data not found.' };
     }
 
+    const tBeforeOffscreen = Date.now();
     await ensureOffscreen();
-    const preimage = await requestPreimageFromOffscreen(invoice, walletRaw);
-    log('[TIPT-BG] Payment successful, preimage len:', preimage.length);
+    const tAfterOffscreen = Date.now();
 
-    const authorization = buildAuthorizationValue(payload.challenge, preimage);
-    if (!authorization) {
-      return { approved: false, error: 'Missing Payment challenge fields for MPP credential retry.' };
+    if (paymentKind === 'lightning') {
+      log('[TIPT-BG] Paying Lightning invoice:', invoice.slice(0, 20));
+      const preimage = await requestPreimageFromOffscreen(invoice, walletRaw);
+      const tAfterPay = Date.now();
+      log(
+        '[TIPT-BG] Lightning payment successful, preimage len:', preimage.length,
+        `| ensureOffscreen=${tAfterOffscreen - tBeforeOffscreen} ms`,
+        `payInvoice=${tAfterPay - tAfterOffscreen} ms`,
+        `total=${tAfterPay - tEnter} ms`,
+      );
+
+      const authorization = buildAuthorizationValue(payload.challenge, preimage);
+      if (!authorization) {
+        return { approved: false, error: 'Missing Payment challenge fields for MPP credential retry.' };
+      }
+
+      return { approved: true, authorization };
     }
 
-    return { approved: true, authorization };
+    // Spark transfer branch. No Lightning preimage exists, so the
+    // L402/Payment Authorization builder doesn't apply — we hand the
+    // transfer id back in a scheme-tagged form for symmetry. The demo
+    // and any future consumer treats this as an opaque receipt.
+    log('[TIPT-BG] Sending Spark transfer to:', invoice.slice(0, 24), `amount=${amountSats}`);
+    if (amountSats === null) {
+      // Defensive — should be unreachable because we validated above.
+      return { approved: false, error: 'Spark transfers require a positive amountSats in the payment request.' };
+    }
+    const txId = await requestSparkTransferFromOffscreen(invoice, amountSats, walletRaw);
+    const tAfterPay = Date.now();
+    log(
+      '[TIPT-BG] Spark transfer successful, id:', txId,
+      `| ensureOffscreen=${tAfterOffscreen - tBeforeOffscreen} ms`,
+      `transfer=${tAfterPay - tAfterOffscreen} ms`,
+      `total=${tAfterPay - tEnter} ms`,
+    );
+
+    return { approved: true, authorization: `SparkTransfer ${txId}` };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to pay invoice.';
     log('[TIPT-BG] Payment failed:', message);
     return { approved: false, error: message };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Wallet prewarm (mpp:payRequest → spin up offscreen + SparkWallet SDK)
+// ---------------------------------------------------------------------------
+// When a page actually requests a payment, kick off the offscreen document
+// and SparkWallet SDK initialisation in the background so the cold-start
+// cost is paid in parallel with the user reading the confirm popup, rather
+// than serialised onto the critical path between clicking "Approve & Pay"
+// and the page receiving its mpp:payResponse.
+//
+// Earlier iterations of this fired on mpp:request (page-load discovery).
+// That was rejected because:
+//   * Every MPP-aware page visit would cause wallet network activity even
+//     when the user never paid.
+//   * Spark's servers would learn the user's IP on mere page visits rather
+//     than only when a payment is actually requested.
+// Firing on mpp:payRequest keeps Spark's view of the user identical to
+// today (they only see traffic when there's a real payment in flight),
+// while still getting the parallelism win.
+//
+// Risks remaining:
+//   * If the user *declines* the confirm popup, the SDK init was wasted
+//     work. Acceptable — the SDK stays cached for subsequent payments and
+//     declined-after-prompt is the minority case anyway.
+//   * If the wallet is locked when the payRequest arrives, prewarm fails
+//     silently (we cannot unlock for them) — the confirm popup is shown
+//     anyway and the actual pay step will surface the locked error.
+let prewarmInflight = false;
+
+function prewarmWallet(): void {
+  if (prewarmInflight) return;
+  prewarmInflight = true;
+  const startedAt = Date.now();
+  void (async () => {
+    try {
+      const walletRaw = await getSynced(WALLET_KEY);
+      if (!walletRaw) {
+        log('[TIPT-BG] prewarm skipped: no wallet stored');
+        return;
+      }
+      await ensureOffscreen();
+      // Errors here are routine (most commonly "Wallet is locked") and
+      // must NOT surface to the user — they merely mean prewarm couldn't
+      // run. The user will see a confirm popup either way, and the actual
+      // pay step that follows will produce a proper user-facing error if
+      // the underlying state is still bad.
+      const response = await chrome.runtime.sendMessage({
+        type: MSG.PREWARM_WALLET,
+        payload: { walletRaw },
+      }) as { ok?: boolean; error?: string } | undefined;
+      if (response?.ok) {
+        log(`[TIPT-BG] prewarm completed in ${Date.now() - startedAt} ms`);
+      } else {
+        log('[TIPT-BG] prewarm declined by offscreen:', response?.error);
+      }
+    } catch (err) {
+      log('[TIPT-BG] prewarm failed (non-fatal):', err);
+    } finally {
+      prewarmInflight = false;
+    }
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -475,17 +808,52 @@ const handlers: Record<string, MessageHandler> = {
     log('[TIPT-BG] mpp:request listener trigger received');
     const tabId = sender.tab?.id;
     if (tabId === undefined) {
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, walletConfigured: false });
       return;
     }
     // Returning `true` keeps the SW alive (and the message channel open)
-    // until `setIcon` resolves. Without this, Chrome may unload the SW
-    // mid-await and silently drop the icon swap, especially when the
-    // worker had just spun up to handle this one message.
-    chrome.action
-      .setIcon({ tabId, path: GREEN_ICON })
-      .catch(() => { /* best-effort */ })
-      .finally(() => sendResponse({ ok: true }));
+    // until both the storage read and the icon/badge writes resolve. Without
+    // this, Chrome may unload the SW mid-await and silently drop the swap,
+    // especially when the worker had just spun up to handle this one
+    // message.
+    void (async () => {
+      let walletConfigured = false;
+      try {
+        const walletRaw = await getSynced(WALLET_KEY);
+        walletConfigured = typeof walletRaw === 'string' && walletRaw.length > 0;
+      } catch {
+        // Treat storage failure as "no wallet" rather than failing the
+        // discovery handshake — pages can still call mpp:payRequest and
+        // surface the eventual failure to the user.
+      }
+
+      const iconPromise = chrome.action
+        .setIcon({ tabId, path: GREEN_ICON })
+        .catch(() => { /* best-effort */ });
+
+      let badgePromise: Promise<void> | Promise<unknown> = Promise.resolve();
+      if (walletConfigured) {
+        // Clear any prior attention badge — the user may have just finished
+        // creating/restoring their wallet since the last mpp:request on
+        // this tab and we want to drop the orange dot immediately.
+        badgePromise = chrome.action
+          .setBadgeText({ tabId, text: '' })
+          .catch(() => { /* best-effort */ });
+      } else {
+        badgePromise = Promise.all([
+          chrome.action.setBadgeBackgroundColor({ tabId, color: ATTENTION_BADGE_COLOR })
+            .catch(() => { /* best-effort */ }),
+          chrome.action.setBadgeText({ tabId, text: ATTENTION_BADGE_TEXT })
+            .catch(() => { /* best-effort */ }),
+        ]);
+      }
+
+      try {
+        await Promise.all([iconPromise, badgePromise]);
+      } finally {
+        sendResponse({ ok: true, walletConfigured });
+      }
+    })();
     return true;
   },
 

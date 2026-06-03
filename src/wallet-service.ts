@@ -3,6 +3,7 @@
 import { SparkWallet } from '@buildonspark/spark-sdk';
 import { decryptText } from './crypto';
 import { loadUnlockKey } from './lib/key-store';
+import { log } from './lib/logger';
 import { getStringField } from './lib/object-helpers';
 
 interface WalletPayload {
@@ -81,17 +82,21 @@ async function pollForPreimage(
   requestId: string,
   maxWaitMs = 60_000,
 ): Promise<string> {
-  const deadline = Date.now() + maxWaitMs;
-  // Exponential backoff capped at 5s. First poll fires at 200ms because
-  // most real Lightning routes settle in under 500ms; waiting 500ms before
-  // the first lookup was leaving easy latency on the table for the happy
-  // path. Long-settling routes still back off so we don't hammer the SDK.
-  let intervalMs = 200;
-  const maxIntervalMs = 5_000;
+  const startedAt = Date.now();
+  const deadline = startedAt + maxWaitMs;
+  // Exponential backoff capped at 1 s (was 5 s — the 5 s ceiling could leave
+  // the user waiting up to ~5 s of pure idle time between the moment the
+  // preimage actually landed and the moment we next polled). The first poll
+  // still fires at 250 ms because most real Lightning routes settle in
+  // under ~500 ms; smaller intervals would hammer the SDK without payoff.
+  let intervalMs = 250;
+  const maxIntervalMs = 1_000;
+  let polls = 0;
 
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, intervalMs));
     intervalMs = Math.min(intervalMs * 2, maxIntervalMs);
+    polls += 1;
 
     const req = await (wallet as unknown as {
       getLightningSendRequest: (id: string) => Promise<Record<string, unknown> | null>;
@@ -103,6 +108,7 @@ async function pollForPreimage(
 
     const preimage = getStringField(req, ['paymentPreimage', 'preimage', 'payment_preimage']);
     if (preimage) {
+      log(`[TIPT-OFFSCREEN] preimage acquired after ${polls} polls in ${Date.now() - startedAt} ms`);
       return preimage;
     }
 
@@ -149,12 +155,14 @@ export interface PayResult {
 // and the background 402 flow (TIPT_OFFSCREEN_PAY_INVOICE). All recovery,
 // fee estimation, and preimage handling is centralised here.
 export async function payInvoice(invoice: string, options: PayOptions = {}): Promise<PayResult> {
+  const tStart = Date.now();
   if (!cachedWallet) {
     if (!options.walletRaw) {
       throw new Error('Wallet not initialized and no encrypted blob provided to re-initialize.');
     }
     await ensureWalletFromBlob(options.walletRaw);
   }
+  const tWalletReady = Date.now();
 
   const wallet = cachedWallet;
   if (!wallet) throw new Error('Wallet not initialized.');
@@ -164,8 +172,10 @@ export async function payInvoice(invoice: string, options: PayOptions = {}): Pro
     const estimated = await getWalletFeeEstimateRaw(invoice);
     maxFeeSats = estimated !== null ? Math.max(25, Math.ceil(estimated * 2)) : 50;
   }
+  const tFeeReady = Date.now();
 
   const result = await wallet.payLightningInvoice({ invoice, maxFeeSats });
+  const tPayReturned = Date.now();
   const r = result as unknown as Record<string, unknown>;
   const txId = typeof r.id === 'string' ? r.id
     : typeof r.transferSparkId === 'string' ? r.transferSparkId
@@ -182,6 +192,15 @@ export async function payInvoice(invoice: string, options: PayOptions = {}): Pro
     if (!cachedWallet) throw new Error('Wallet disposed before preimage was available.');
     preimage = await pollForPreimage(cachedWallet, txId);
   }
+  const tDone = Date.now();
+
+  log(
+    `[TIPT-OFFSCREEN] payInvoice timing (ms): walletReady=${tWalletReady - tStart}`,
+    `feeEstimate=${tFeeReady - tWalletReady}`,
+    `payLightningInvoice=${tPayReturned - tFeeReady}`,
+    `preimage=${tDone - tPayReturned}`,
+    `total=${tDone - tStart}`,
+  );
 
   return { txId, preimage };
 }
@@ -210,7 +229,8 @@ export async function disposeWallet(): Promise<void> {
   await teardownWallet(walletToDispose);
 }
 
-type WalletEventListener = (event: 'transfer:claimed' | 'deposit:confirmed', balance: bigint) => void;
+export type WalletEventName = 'transfer:claimed' | 'deposit:confirmed' | 'balance:update';
+type WalletEventListener = (event: WalletEventName, balance: bigint) => void;
 const walletEventListeners = new Set<WalletEventListener>();
 
 export function registerWalletEventListener(fn: WalletEventListener): () => void {
@@ -220,7 +240,7 @@ export function registerWalletEventListener(fn: WalletEventListener): () => void
   };
 }
 
-function emitWalletEvent(event: 'transfer:claimed' | 'deposit:confirmed', balance: bigint) {
+function emitWalletEvent(event: WalletEventName, balance: bigint) {
   for (const listener of walletEventListeners) {
     try { listener(event, balance); } catch { /* ignore listener errors */ }
   }
@@ -229,12 +249,91 @@ function emitWalletEvent(event: 'transfer:claimed' | 'deposit:confirmed', balanc
 function subscribeWalletEvents(wallet: SparkWallet) {
   wallet.on('transfer:claimed', (_id: string, balance: bigint) => emitWalletEvent('transfer:claimed', balance));
   wallet.on('deposit:confirmed', (_id: string, balance: bigint) => emitWalletEvent('deposit:confirmed', balance));
+  // BalanceUpdate is the SDK's catch-all balance-changed event — it fires for
+  // claims, swaps, deposits and outgoing transfers alike. Critically for the
+  // restore flow, it fires for transfers the SDK's background claim loop
+  // settles *during* SparkWallet.initialize(), which is exactly the window
+  // where the popup hasn't yet rendered its first balance and the
+  // transfer:claimed events were being missed. Subscribing to it here means
+  // a restored wallet's balance now self-corrects within the same popup
+  // session, instead of only after a popup close/reopen cycle.
+  wallet.on('balance:update', (b: { available: bigint }) => {
+    if (typeof b?.available === 'bigint') emitWalletEvent('balance:update', b.available);
+  });
 }
 
 export async function getWalletBalance(): Promise<bigint> {
   if (!cachedWallet) throw new Error('Wallet not initialized.');
   const result = await cachedWallet.getBalance();
   return result.balance;
+}
+
+// Spark address (bech32m-encoded identity, e.g. sp1qq…). Stable for the
+// lifetime of the wallet so callers may freely cache it. The SDK call is
+// resolved entirely from the cached identity material — no Spark cluster
+// round trip — so this is cheap to invoke from the popup settings menu.
+export async function getSparkAddress(): Promise<string> {
+  if (!cachedWallet) throw new Error('Wallet not initialized.');
+  return cachedWallet.getSparkAddress();
+}
+
+export interface SparkTransferOptions {
+  // Same cold-restart semantics as `PayOptions.walletRaw` — the background
+  // hands the encrypted blob across the IPC boundary so the offscreen can
+  // re-initialise the SDK if Chrome reclaimed the document since the last
+  // call. The PIN never crosses the boundary; decryption happens locally
+  // via the IndexedDB-cached AES-GCM key (see decryptMnemonicWithCachedKey).
+  walletRaw?: string;
+}
+
+export interface SparkTransferResult {
+  // Spark transfer id (WalletTransfer.id) — opaque to TIPT, useful only as
+  // a receipt the page can quote back to the merchant. There is no
+  // Lightning preimage on this path.
+  txId: string;
+}
+
+// Spark-native transfer to a receiver Spark address. Mirrors `payInvoice`'s
+// cold-restart pattern (ensureWalletFromBlob + timing logs) so the prewarm
+// fastpath benefits both settlement types identically. We *do not* attempt
+// to validate the address here — the SDK rejects malformed addresses with
+// a structured error which we surface to the caller as-is.
+export async function payToSparkAddress(
+  receiverSparkAddress: string,
+  amountSats: number,
+  options: SparkTransferOptions = {},
+): Promise<SparkTransferResult> {
+  const tStart = Date.now();
+  if (!Number.isFinite(amountSats) || amountSats <= 0 || !Number.isInteger(amountSats)) {
+    throw new Error('Spark transfer requires a positive integer amountSats.');
+  }
+  if (!cachedWallet) {
+    if (!options.walletRaw) {
+      throw new Error('Wallet not initialized and no encrypted blob provided to re-initialize.');
+    }
+    await ensureWalletFromBlob(options.walletRaw);
+  }
+  const tWalletReady = Date.now();
+
+  const wallet = cachedWallet;
+  if (!wallet) throw new Error('Wallet not initialized.');
+
+  const result = await wallet.transfer({ amountSats, receiverSparkAddress });
+  const tTransferReturned = Date.now();
+
+  const r = result as unknown as Record<string, unknown>;
+  const txId = typeof r.id === 'string' ? r.id : '';
+  if (!txId) {
+    throw new Error('Spark transfer completed but no transfer id was returned.');
+  }
+
+  log(
+    `[TIPT-OFFSCREEN] payToSparkAddress timing (ms): walletReady=${tWalletReady - tStart}`,
+    `transfer=${tTransferReturned - tWalletReady}`,
+    `total=${tTransferReturned - tStart}`,
+  );
+
+  return { txId };
 }
 
 // Recursive in-place walk that converts every `bigint` to its decimal

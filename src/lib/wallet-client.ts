@@ -10,7 +10,7 @@ export async function sendWalletMessage<T>(msg: Record<string, unknown>): Promis
 }
 
 export interface WalletEvent {
-  event: 'transfer:claimed' | 'deposit:confirmed';
+  event: 'transfer:claimed' | 'deposit:confirmed' | 'balance:update';
   balance: string;
 }
 

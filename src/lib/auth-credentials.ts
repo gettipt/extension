@@ -6,7 +6,15 @@ import { log } from './logger';
 // `takeBoundedString` / `takePaymentChallenge`) — keep them in sync.
 export interface ChallengePayload {
   scheme: string;
+  // For Lightning payments this is a BOLT11 invoice; for Spark transfers
+  // it's a Spark address. The discrimination happens in background.ts via
+  // src/lib/payment-target.ts. The field name stays `invoice` for wire
+  // compatibility with existing MPP integrators.
   invoice: string;
+  // Optional payer-supplied amount. Required for Spark transfers (no
+  // embedded amount in a Spark address); ignored for BOLT11 invoices
+  // (their HRP amount is always authoritative).
+  amountSats?: number;
   rawHeader?: string;
   macaroon?: string;
   token?: string;

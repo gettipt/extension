@@ -6,9 +6,12 @@ import {
   createWalletInvoice,
   getWalletFeeEstimate,
   payInvoice,
+  payToSparkAddress,
   hasCachedWallet,
   disposeWallet,
   registerWalletEventListener,
+  ensureWalletFromBlob,
+  getSparkAddress,
 } from './wallet-service';
 import { clearUnlockKey } from './lib/key-store';
 import { isInternalSender } from './lib/runtime';
@@ -23,6 +26,23 @@ const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Env
     const r = await payInvoice(invoice, { walletRaw, pollPreimage: true });
     if (!r.preimage) return { ok: false, error: 'Payment succeeded but preimage was not available.' };
     return { ok: true, preimage: r.preimage };
+  },
+  async [MSG.OFFSCREEN_SPARK_TRANSFER](p) {
+    const receiverSparkAddress = p.receiverSparkAddress as string | undefined;
+    const amountSats = typeof p.amountSats === 'number' ? p.amountSats : NaN;
+    const walletRaw = p.walletRaw as string | undefined;
+    if (!receiverSparkAddress) return { ok: false, error: 'Missing receiver Spark address for transfer.' };
+    if (!walletRaw) return { ok: false, error: 'Missing wallet ciphertext for Spark transfer.' };
+    const r = await payToSparkAddress(receiverSparkAddress, amountSats, { walletRaw });
+    return { ok: true, txId: r.txId };
+  },
+  async [MSG.PREWARM_WALLET](p) {
+    const walletRaw = p.walletRaw as string | undefined;
+    if (!walletRaw) return { ok: false, error: 'Missing wallet ciphertext for prewarm.' };
+    // Idempotent in wallet-service. Throws if the wallet is locked (no
+    // unlock key in IndexedDB) — caller treats every failure as silent.
+    await ensureWalletFromBlob(walletRaw);
+    return { ok: true };
   },
   async [MSG.WALLET_CREATE](p) {
     const mnemonic = p.mnemonic as string | undefined;
@@ -60,6 +80,10 @@ const handlers: Record<string, (payload: Record<string, unknown>) => Promise<Env
   },
   async [MSG.HAS_WALLET]() {
     return { ok: true, hasWallet: hasCachedWallet() };
+  },
+  async [MSG.GET_SPARK_ADDRESS]() {
+    const address = await getSparkAddress();
+    return { ok: true, address };
   },
   async [MSG.DISPOSE_WALLET]() {
     await disposeWallet();
