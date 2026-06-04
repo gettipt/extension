@@ -1,4 +1,6 @@
+import { useEffect, useRef } from 'react';
 import { PinInput } from './PinInput';
+import type { PinInputHandle } from './PinInput';
 import { PIN_LENGTH } from '../constants';
 
 type PinSetupStep = 'enter' | 'confirm';
@@ -28,6 +30,44 @@ export function PinSetupScreen({
   onConfirm,
   onCancel,
 }: PinSetupScreenProps) {
+  const pinInputRef = useRef<PinInputHandle>(null);
+
+  useEffect(() => {
+    if (pinLoading) return;
+
+    const focus = () => {
+      pinInputRef.current?.focusFirst();
+    };
+
+    // When recovery is started from a file picker, the OS dialog steals
+    // window focus while this screen mounts. The popup never closes, but
+    // Chrome restores focus to the previously-focused element *after* the
+    // window 'focus' event fires — so calling focus() synchronously in the
+    // handler gets clobbered. Defer to the next frame (and a short timeout)
+    // so our focus lands after Chrome's restore.
+    const deferredFocus = () => {
+      requestAnimationFrame(focus);
+      window.setTimeout(focus, 60);
+    };
+
+    const rafId = requestAnimationFrame(focus);
+    const timerId = window.setTimeout(focus, 120);
+    const onWindowFocus = () => deferredFocus();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') deferredFocus();
+    };
+
+    window.addEventListener('focus', onWindowFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.clearTimeout(timerId);
+      window.removeEventListener('focus', onWindowFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [pinSetupStep, pinLoading]);
+
   return (
     <div className="space-y-4 p-4">
       <div className="text-center">
@@ -40,6 +80,7 @@ export function PinSetupScreen({
         </p>
       </div>
       <PinInput
+        ref={pinInputRef}
         key={pinSetupStep}
         value={pinSetupStep === 'enter' ? pinInput : pinConfirm}
         onChange={pinSetupStep === 'enter' ? onPinInputChange : onPinConfirmChange}

@@ -1,14 +1,20 @@
-import { useEffect, useRef } from 'react';
+import { forwardRef, useImperativeHandle, useRef } from 'react';
 import { PIN_LENGTH } from '../constants';
 
-export function PinInput({
-  value, onChange, onSubmit, disabled,
-}: {
+interface PinInputProps {
   value: string;
   onChange: (v: string) => void;
   onSubmit?: (v: string) => void;
   disabled?: boolean;
-}) {
+}
+
+export interface PinInputHandle {
+  focusFirst: () => void;
+}
+
+export const PinInput = forwardRef<PinInputHandle, PinInputProps>(function PinInput({
+  value, onChange, onSubmit, disabled,
+}, ref) {
   // Single ref array — earlier code allocated N separate `useRef` calls in
   // a literal array, which (a) breaks hook rules if PIN_LENGTH ever changes,
   // and (b) allocates more objects than needed.
@@ -18,41 +24,15 @@ export function PinInput({
   };
   const focusAt = (i: number) => inputsRef.current[i]?.focus();
 
-  // Explicit post-mount focus. React's `autoFocus` prop calls focus() during
-  // the commit phase, which Chrome's extension popup can silently drop when
-  // the mount is triggered by a click on the previous screen's button
-  // (focus often stays on the originating button). Calling focus() from an
-  // effect runs after the commit settles, so the cursor reliably lands in
-  // the first input on every mount of this component — including remounts
-  // (e.g. when PinSetupScreen swaps the `key` between 'enter' and 'confirm').
-  useEffect(() => {
-    const focusFirst = () => {
-      if (disabled) return;
-      inputsRef.current[0]?.focus();
-    };
+  const focusFirst = () => {
+    if (disabled) return;
+    const first = inputsRef.current[0];
+    if (!first) return;
+    try { window.focus(); } catch { /* best-effort */ }
+    first.focus({ preventScroll: true });
+  };
 
-    // File-picker flows (recover from backup file) can restore focus to the
-    // extension window after this effect runs. Retry on the next frame, a
-    // short timeout, and focus/visibility regain so the first PIN box still
-    // receives focus when control returns from native dialogs.
-    const rafId = requestAnimationFrame(focusFirst);
-    const timerId = window.setTimeout(focusFirst, 120);
-    const onWindowFocus = () => focusFirst();
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') focusFirst();
-    };
-
-    focusFirst();
-    window.addEventListener('focus', onWindowFocus);
-    document.addEventListener('visibilitychange', onVisibility);
-
-    return () => {
-      cancelAnimationFrame(rafId);
-      window.clearTimeout(timerId);
-      window.removeEventListener('focus', onWindowFocus);
-      document.removeEventListener('visibilitychange', onVisibility);
-    };
-  }, [disabled]);
+  useImperativeHandle(ref, () => ({ focusFirst }), [disabled]);
 
   const digits = value.split('').concat(Array(PIN_LENGTH).fill('')).slice(0, PIN_LENGTH);
 
@@ -87,6 +67,7 @@ export function PinInput({
           type="password"
           inputMode="numeric"
           maxLength={1}
+          autoFocus={i === 0}
           value={d}
           onChange={(e) => handleChange(i, e)}
           onKeyDown={(e) => handleKey(i, e)}
@@ -96,5 +77,5 @@ export function PinInput({
       ))}
     </div>
   );
-}
+});
 
