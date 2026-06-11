@@ -11,6 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@buildonspark/lightning-mpp-sdk": "^0.1.4",
     "@buildonspark/spark-sdk": "^0.7.15",
     "bech32": "^2.0.0",
     "qrcode.react": "^4.2.0",

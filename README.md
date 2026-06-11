@@ -48,6 +48,25 @@ Build output is generated at:
 dist/extension/
 ```
 
+## TIPT Lightning MPP SDK (client-side)
+
+This repo now includes a browser-side SDK wrapper that extends the Lightning MPP client flow and routes 402 payment approval through the TIPT extension automatically.
+
+```ts
+import { createTiptLightningClient } from './src/sdk'
+
+const tipt = createTiptLightningClient({
+  polyfill: false,
+})
+
+const response = await tipt.fetch('https://api.example.com/paid-endpoint')
+```
+
+Behavior:
+- Intercepts `402` responses via `Mppx.create`.
+- Converts Lightning `Payment` challenge fields into TIPT `mpp:payRequest`.
+- Receives `mpp:payResponse.authorization` from TIPT and retries the original request automatically.
+
 ## Load in Chrome as an Extension
 
 1. Open `chrome://extensions`

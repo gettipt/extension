@@ -20,6 +20,9 @@ const PAY_REQUEST_402 = 'TIPT_402_PAY_REQUEST';
 const MAX_INVOICE_LEN = 8192;
 const MAX_SHORT_FIELD_LEN = 512;
 const MAX_OPAQUE_LEN = 4096;
+// Payment challenge `request` is a serialized payload that can include a full
+// BOLT11 invoice, so it can be much larger than short metadata fields.
+const MAX_PAYMENT_REQUEST_LEN = 4096;
 const MAX_REQUEST_ID_LEN = 256;
 
 interface MppPayDetail {
@@ -106,7 +109,7 @@ function takePaymentChallenge(raw: unknown): MppPayDetail['paymentChallenge'] | 
   const realm = takeBoundedString(c.realm, MAX_SHORT_FIELD_LEN);
   const method = takeBoundedString(c.method, MAX_SHORT_FIELD_LEN);
   const intent = takeBoundedString(c.intent, MAX_SHORT_FIELD_LEN);
-  const request = takeBoundedString(c.request, MAX_SHORT_FIELD_LEN);
+  const request = takeBoundedString(c.request, MAX_PAYMENT_REQUEST_LEN);
   if (!id || !realm || !method || !intent || !request) return undefined;
   const expires = c.expires !== undefined ? takeBoundedString(c.expires, MAX_SHORT_FIELD_LEN) : undefined;
   const opaque = c.opaque !== undefined ? takeBoundedString(c.opaque, MAX_OPAQUE_LEN) : undefined;

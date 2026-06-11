@@ -185,6 +185,17 @@ window.addEventListener('mpp:payResponse', (e) => {
 
 The wire field is named `invoice` for back-compatibility with sites already integrating MPP, but the meaning is generalised to "payment target" — it may be a BOLT11 invoice or a Spark address. The extension classifies by prefix (see *Payment kinds*).
 
+### SDK wrapper for automatic 402 handling
+
+`src/sdk/tipt-lightning-mpp-client.ts` provides `createTiptLightningClient()`, a wrapper built on top of `@buildonspark/lightning-mpp-sdk` + `mppx` client primitives:
+
+1. Intercepts HTTP `402` responses through `Mppx.create`.
+2. Reads the `lightning/charge` challenge and dispatches `mpp:payRequest` to TIPT.
+3. Waits for `mpp:payResponse` and uses the returned `authorization` value as the retry credential.
+4. Automatically retries the original request with `Authorization: <credential>`.
+
+This keeps website integration aligned with MPP challenge semantics while preserving TIPT as the payment-authority UX and wallet execution surface.
+
 ### Payment kinds
 
 TIPT discriminates payment targets via `src/lib/payment-target.ts`. The classifier uses pure prefix matching on the lowercased value (Lightning HRPs always start with `ln`, Spark addresses always start with `sp` — the two families are disjoint, so prefix matching is unambiguous):
@@ -516,4 +527,3 @@ src/
 | `tipt_pending_confirm_<id>` | `chrome.storage.session` | Per-pending-confirm display payload `{ host, url, method, invoice, amountSats, expiresAt }` used by the confirm popup to rehydrate without re-querying the service worker. Cleared on user response, on the matching `chrome.alarms` expiry, or when the session ends. |
 
 All storage access goes through `src/lib/storage.ts` (`getItem` / `setItem` / `removeItem` / `getWithMigration`); there is no `localStorage` write-through.
-

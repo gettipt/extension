@@ -305,7 +305,7 @@
     </div>
     <div class="kind-hint" id="kindHint">Detected: —</div>
     <div class="error-msg" id="formError"></div>
-    <button id="payBtn" disabled>Pay via TIPT</button>
+    <button id="payBtn" disabled>Pay via TIPT SDK</button>
   </div>
 
   <!-- Response -->
@@ -329,7 +329,9 @@
     </div>
   </div>
 
-  <script>
+  <script type="module">
+    import { createTiptLightningClient } from './src/sdk';
+
     // ── Bech32 decoder (for lnurl1… strings) ──────────────────────────────────
     const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
     const GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
@@ -469,6 +471,68 @@
       document.getElementById('formError').textContent = msg;
     }
 
+    function makeDemoPaidFetch(invoice, amountSats, endpoint) {
+      const paidResponse = {
+        ok: true,
+        endpoint,
+        invoicePreview: `${invoice.slice(0, 24)}…`,
+      };
+
+      return async (input, init) => {
+        const requestUrl = input instanceof Request ? input.url : String(input);
+        if (requestUrl !== endpoint) return fetch(input, init);
+
+        const headers = new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : undefined),
+        );
+        const authorization = headers.get('Authorization');
+        if (!authorization) {
+          const challenge = {
+            id: crypto.randomUUID(),
+            realm: window.location.host || 'localhost',
+            method: 'lightning',
+            intent: 'charge',
+            request: {
+              amount: String(amountSats),
+              currency: 'BTC',
+              description: 'TIPT demo invoice payment',
+              methodDetails: { invoice, network: 'mainnet' },
+            },
+          };
+
+          // mppx expects `request` to be a base64url-encoded JSON payload.
+          const requestJson = JSON.stringify(challenge.request);
+          const request = btoa(unescape(encodeURIComponent(requestJson)))
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+
+          return new Response(JSON.stringify({ error: 'payment required' }), {
+            status: 402,
+            headers: {
+              'Content-Type': 'application/json',
+              'WWW-Authenticate':
+                `Payment id="${challenge.id}", realm="${challenge.realm}", method="${challenge.method}", intent="${challenge.intent}", request="${request}"`,
+            },
+          });
+        }
+
+        return new Response(JSON.stringify({ ...paidResponse, authorization }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      };
+    }
+
+    async function runSdkDemoPayment(invoice, amountSats) {
+      const endpoint = 'https://demo.tipt.local/paid-resource';
+      const tipt = createTiptLightningClient({
+        polyfill: false,
+        fetch: makeDemoPaidFetch(invoice, amountSats, endpoint),
+      });
+      return tipt.fetch(endpoint, { method: 'GET' });
+    }
+
     // ── Wallet status ─────────────────────────────────────────────────────────
     let walletReady = false;
     window.addEventListener('mpp:response', (e) => {
@@ -490,6 +554,19 @@
       }
       refreshPayButton();
       logEvent('mpp:response', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}], walletConfigured=${detail.walletConfigured}`);
+    });
+
+    // Surface extension bridge traffic in the event log so the SDK flow is visible.
+    window.addEventListener('mpp:payRequest', (e) => {
+      const d = e.detail || {};
+      logEvent(
+        'mpp:payRequest',
+        `requestId=${String(d.requestId || '?').slice(0, 8)}…, invoice=${String(d.invoice || '').slice(0, 16)}…`,
+      );
+    });
+    window.addEventListener('mpp:payResponse', (e) => {
+      const d = e.detail || {};
+      logEvent('mpp:payResponse', `approved=${Boolean(d.approved)}, error=${d.error || 'none'}`);
     });
 
     // Request announcement on load
@@ -550,22 +627,17 @@
       document.getElementById('responseEmpty').style.display = 'none';
       document.getElementById('responseBox').style.display = 'none';
 
-      // Build the mpp:payRequest detail. `target` is what the extension
-      // sees in the `invoice` wire field — a BOLT11 invoice or a Spark
-      // address. For Lightning Address / LNURL we resolve to a BOLT11
-      // invoice up-front. For Spark we pass the address through and
-      // include `amountSats`.
+      // Build a Lightning invoice target. LNURL/Lightning Address are resolved
+      // up-front; then the SDK drives the Payment challenge flow automatically.
       let target;
       let amountSatsForRequest;
-      let schemeForRequest = 'L402';
 
       try {
         if (cls.kind === 'bolt11') {
           target = rawRecipient;
+          amountSatsForRequest = 1;
         } else if (cls.kind === 'spark') {
-          target = rawRecipient;
-          amountSatsForRequest = amountSatsRaw;
-          schemeForRequest = 'SparkTransfer';
+          throw new Error('Spark addresses are not supported in the Lightning SDK demo. Use BOLT11, LNURL, or Lightning Address.');
         } else {
           // Lightning Address or LNURL — resolve and fetch invoice.
           logEvent('lnurl', `resolving ${rawRecipient}`);
@@ -577,64 +649,49 @@
           if (amountSatsRaw > maxSats) throw new Error(`Maximum is ${maxSats} sats.`);
           logEvent('lnurl', `fetching invoice for ${amountSatsRaw} sats`);
           target = await fetchInvoice(payInfo.callback, amountSatsRaw * 1000);
+          amountSatsForRequest = amountSatsRaw;
           logEvent('lnurl', `invoice: ${target.slice(0, 24)}…`);
         }
       } catch (err) {
         setFormError(err.message);
         payBtn.disabled = false;
-        payBtn.textContent = 'Pay via TIPT';
+        payBtn.textContent = 'Pay via TIPT SDK';
         refreshPayButton();
         return;
       }
 
-      const requestId = crypto.randomUUID();
-      logEvent('mpp:payRequest', `requestId=${requestId.slice(0, 8)}…, kind=${cls.kind}`);
-      payBtn.textContent = 'Waiting for TIPT…';
+      payBtn.textContent = 'Paying via SDK…';
 
-      const detail = {
-        requestId,
-        invoice: target,
-        scheme: schemeForRequest,
-      };
-      if (amountSatsForRequest !== undefined) detail.amountSats = amountSatsForRequest;
-
-      window.dispatchEvent(new CustomEvent('mpp:payRequest', { detail }));
-
-      // One-time response listener
-      function onResponse(e) {
-        const d = e.detail || {};
-        if (d.requestId !== requestId) return;
-        window.removeEventListener('mpp:payResponse', onResponse);
-
-        logEvent('mpp:payResponse', `approved=${d.approved}`);
-
-        const badge = document.getElementById('responseBadge');
-        if (d.approved) {
-          badge.className = 'badge badge-success';
-          badge.textContent = 'APPROVED';
-        } else {
-          badge.className = 'badge badge-error';
-          badge.textContent = 'REJECTED';
-        }
-
-        document.getElementById('responseJson').textContent = JSON.stringify(d, null, 2);
-        document.getElementById('responseBox').style.display = 'block';
-
-        payBtn.textContent = 'Pay via TIPT';
-        refreshPayButton();
+      const badge = document.getElementById('responseBadge');
+      try {
+        const response = await runSdkDemoPayment(target, amountSatsForRequest ?? 1);
+        const body = await response.json();
+        badge.className = 'badge badge-success';
+        badge.textContent = 'APPROVED';
+        document.getElementById('responseJson').textContent = JSON.stringify(
+          {
+            approved: true,
+            status: response.status,
+            body,
+          },
+          null,
+          2,
+        );
+      } catch (err) {
+        badge.className = 'badge badge-error';
+        badge.textContent = 'REJECTED';
+        document.getElementById('responseJson').textContent = JSON.stringify(
+          {
+            approved: false,
+            error: err?.message || String(err),
+          },
+          null,
+          2,
+        );
       }
-
-      window.addEventListener('mpp:payResponse', onResponse);
-
-      // Timeout if no response in 90s
-      setTimeout(() => {
-        window.removeEventListener('mpp:payResponse', onResponse);
-        if (payBtn.textContent === 'Waiting for TIPT…') {
-          setFormError('No response from TIPT after 90 seconds.');
-          payBtn.textContent = 'Pay via TIPT';
-          refreshPayButton();
-        }
-      }, 90_000);
+      document.getElementById('responseBox').style.display = 'block';
+      payBtn.textContent = 'Pay via TIPT SDK';
+      refreshPayButton();
     });
   </script>
 </body>

@@ -98,6 +98,9 @@ async function getConfirmPopupTopRight(): Promise<{ left: number; top: number } 
 const MAX_INVOICE_LEN = 8192;
 const MAX_SHORT_FIELD_LEN = 512;
 const MAX_OPAQUE_LEN = 4096;
+// Payment challenge `request` may carry a serialized method request including
+// full BOLT11 invoices, so it needs a larger bound than short metadata fields.
+const MAX_PAYMENT_REQUEST_LEN = 4096;
 const MAX_REQUEST_ID_LEN = 256;
 
 interface PayRequestPayload {
@@ -241,11 +244,16 @@ function validate402Payload(payload: unknown): PayRequestPayload | null {
   if (ch.paymentChallenge !== undefined) {
     if (!ch.paymentChallenge || typeof ch.paymentChallenge !== 'object') return null;
     const pc = ch.paymentChallenge as Record<string, unknown>;
-    const required: Array<'id' | 'realm' | 'method' | 'intent' | 'request'> = ['id', 'realm', 'method', 'intent', 'request'];
-    for (const k of required) {
+    const shortRequired: Array<'id' | 'realm' | 'method' | 'intent'> = ['id', 'realm', 'method', 'intent'];
+    for (const k of shortRequired) {
       const v = pc[k];
       if (typeof v !== 'string' || v.length === 0 || v.length > MAX_SHORT_FIELD_LEN) return null;
     }
+    if (
+      typeof pc.request !== 'string'
+      || pc.request.length === 0
+      || pc.request.length > MAX_PAYMENT_REQUEST_LEN
+    ) return null;
     if (pc.expires !== undefined && (typeof pc.expires !== 'string' || pc.expires.length > MAX_SHORT_FIELD_LEN)) return null;
     if (pc.opaque !== undefined && (typeof pc.opaque !== 'string' || pc.opaque.length > MAX_OPAQUE_LEN)) return null;
     paymentChallenge = {
