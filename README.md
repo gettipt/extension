@@ -50,10 +50,14 @@ dist/extension/
 
 ## MPP Lightning Extension SDK (client-side)
 
-This repo now includes a browser-side SDK wrapper that extends the Lightning MPP client flow and routes 402 payment approval through the compatible extension automatically.
+The browser-side SDK that extends the Lightning MPP client flow and routes 402 payment approval through this extension now lives in its own package: [`lightning-mpp-extension-sdk`](https://www.npmjs.com/package/lightning-mpp-extension-sdk).
+
+```bash
+npm install lightning-mpp-extension-sdk @buildonspark/lightning-mpp-sdk mppx
+```
 
 ```ts
-import { createTiptLightningClient } from './src/sdk'
+import { createTiptLightningClient } from 'lightning-mpp-extension-sdk'
 
 const tipt = createTiptLightningClient({
   polyfill: false,
