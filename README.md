@@ -61,10 +61,3 @@ npm run build:extension
 2. Return to `chrome://extensions`.
 3. Click Reload on the TIPT extension card.
 
-## Optional: Web Dev Mode
-
-For UI iteration outside Chrome extension loading:
-
-```bash
-npm run dev
-```

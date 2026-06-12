@@ -330,7 +330,14 @@
   </div>
 
   <script type="module">
-    import { createTiptLightningClient } from 'lightning-mpp-extension-sdk';
+    // Support both bundled/dev environments (bare import) and direct browser
+    // loading of this standalone HTML file (ESM CDN fallback).
+    const sdkMod = await import('lightning-mpp-extension-sdk')
+      .catch(() => import('https://esm.sh/lightning-mpp-extension-sdk@0.1.1'));
+    const createTiptLightningClient = sdkMod.createLightningMppExtensionClient;
+    if (typeof createTiptLightningClient !== 'function') {
+      throw new Error('lightning-mpp-extension-sdk does not export createLightningMppExtensionClient.');
+    }
 
     // ── Bech32 decoder (for lnurl1… strings) ──────────────────────────────────
     const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
