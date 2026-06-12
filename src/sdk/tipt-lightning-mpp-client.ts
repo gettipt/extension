@@ -2,24 +2,28 @@ import { charge as lightningChargeMethod } from '@buildonspark/lightning-mpp-sdk
 import { Mppx } from '@buildonspark/lightning-mpp-sdk/client';
 import { Method, PaymentRequest } from 'mppx';
 
-const MPP_REQUEST_EVENT = 'mpp:request';
-const MPP_RESPONSE_EVENT = 'mpp:response';
-const MPP_PAY_REQUEST_EVENT = 'mpp:payRequest';
-const MPP_PAY_RESPONSE_EVENT = 'mpp:payResponse';
+const MPP_EXTENSION_EVENT = 'mpp:extension';
+const MPP_CHALLENGE_EVENT = 'mpp:challenge';
+const MPP_CREDENTIAL_EVENT = 'mpp:credential';
 
 const DEFAULT_PAYMENT_TIMEOUT_MS = 90_000;
 const DEFAULT_EXTENSION_PROBE_TIMEOUT_MS = 1_500;
 
 interface MppResponseDetail {
+  type?: string;
   name?: string;
+  paymentMethods?: string[];
+  intents?: string[];
+  supportsRequestedPaymentMethods?: boolean;
+  supportsRequestedIntents?: boolean;
 }
 
-interface MppPayRequestDetail {
+interface MppExtChallengeDetail {
   requestId: string;
   invoice: string;
   amountSats?: number;
   scheme: 'Payment';
-  paymentChallenge: {
+  challenge: {
     id: string;
     realm: string;
     method: string;
@@ -30,10 +34,10 @@ interface MppPayRequestDetail {
   };
 }
 
-interface MppPayResponseDetail {
+interface MppExtCredentialDetail {
   requestId?: string;
   approved?: boolean;
-  authorization?: string;
+  credential?: string;
   error?: string;
 }
 
@@ -66,23 +70,39 @@ function waitForExtensionResponse(timeoutMs: number): Promise<MppResponseDetail>
 
     const onResponse = (event: Event) => {
       const detail = (event as CustomEvent<MppResponseDetail>).detail;
-      if (detail?.name !== 'TIPT') return;
+      if (detail?.type !== 'response' || detail?.name !== 'TIPT') return;
+      if (detail.supportsRequestedPaymentMethods === false) {
+        cleanup();
+        reject(new Error('TIPT does not support the requested payment method(s).'));
+        return;
+      }
+      if (detail.supportsRequestedIntents === false) {
+        cleanup();
+        reject(new Error('TIPT does not support the requested intent(s).'));
+        return;
+      }
       cleanup();
       resolve(detail);
     };
 
     const cleanup = () => {
       window.clearTimeout(timer);
-      window.removeEventListener(MPP_RESPONSE_EVENT, onResponse as EventListener);
+      window.removeEventListener(MPP_EXTENSION_EVENT, onResponse as EventListener);
     };
 
-    window.addEventListener(MPP_RESPONSE_EVENT, onResponse as EventListener);
-    window.dispatchEvent(new CustomEvent(MPP_REQUEST_EVENT));
+    window.addEventListener(MPP_EXTENSION_EVENT, onResponse as EventListener);
+    window.dispatchEvent(new CustomEvent(MPP_EXTENSION_EVENT, {
+      detail: {
+        type: 'request',
+        paymentMethods: ['lightning'],
+        intents: ['charge'],
+      },
+    }));
   });
 }
 
-function requestPaymentFromExtension(
-  detail: MppPayRequestDetail,
+function requestCredentialFromExtension(
+  detail: MppExtChallengeDetail,
   timeoutMs: number,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -92,7 +112,7 @@ function requestPaymentFromExtension(
     }, timeoutMs);
 
     const onPayResponse = (event: Event) => {
-      const response = (event as CustomEvent<MppPayResponseDetail>).detail;
+      const response = (event as CustomEvent<MppExtCredentialDetail>).detail;
       if (!response || response.requestId !== detail.requestId) return;
 
       cleanup();
@@ -101,20 +121,20 @@ function requestPaymentFromExtension(
         reject(new Error(response.error ?? 'TIPT declined payment.'));
         return;
       }
-      if (!response.authorization) {
-        reject(new Error('TIPT approved payment but returned no authorization.'));
+      if (!response.credential) {
+        reject(new Error('TIPT approved payment but returned no credential.'));
         return;
       }
-      resolve(response.authorization);
+      resolve(response.credential);
     };
 
     const cleanup = () => {
       window.clearTimeout(timer);
-      window.removeEventListener(MPP_PAY_RESPONSE_EVENT, onPayResponse as EventListener);
+      window.removeEventListener(MPP_CREDENTIAL_EVENT, onPayResponse as EventListener);
     };
 
-    window.addEventListener(MPP_PAY_RESPONSE_EVENT, onPayResponse as EventListener);
-    window.dispatchEvent(new CustomEvent(MPP_PAY_REQUEST_EVENT, { detail }));
+    window.addEventListener(MPP_CREDENTIAL_EVENT, onPayResponse as EventListener);
+    window.dispatchEvent(new CustomEvent(MPP_CHALLENGE_EVENT, { detail }));
   });
 }
 
@@ -148,13 +168,13 @@ export function createTiptLightningClient(options: CreateTiptLightningClientOpti
       const request = PaymentRequest.serialize(challenge.request);
       const opaque = challenge.opaque ? PaymentRequest.serialize(challenge.opaque) : undefined;
 
-      return requestPaymentFromExtension(
+      return requestCredentialFromExtension(
         {
           requestId,
           invoice,
           amountSats: parseAmountSats(challenge.request.amount),
           scheme: 'Payment',
-          paymentChallenge: {
+          challenge: {
             id: challenge.id,
             realm: challenge.realm,
             method: challenge.method,

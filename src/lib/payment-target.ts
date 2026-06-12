@@ -1,4 +1,4 @@
-// Classifies a string supplied via `mpp:payRequest.detail.invoice` (or the
+// Classifies a string supplied via `mpp:challenge.detail.invoice` (or the
 // popup's Send field) as either a BOLT11 Lightning invoice or a Spark
 // address. Used to route the payment to the right SDK call:
 //

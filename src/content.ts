@@ -25,7 +25,7 @@ const MAX_OPAQUE_LEN = 4096;
 const MAX_PAYMENT_REQUEST_LEN = 4096;
 const MAX_REQUEST_ID_LEN = 256;
 
-interface MppPayDetail {
+interface MppExtChallengeDetail {
   requestId: string;
   // Payment target. Today this is either a BOLT11 Lightning invoice
   // ("lnbc…") or a Spark address ("spark1…", "sp1…" etc.). The wire field
@@ -41,7 +41,7 @@ interface MppPayDetail {
   scheme?: string;
   macaroon?: string;
   token?: string;
-  paymentChallenge?: {
+  challenge?: {
     id: string;
     realm: string;
     method: string;
@@ -52,33 +52,81 @@ interface MppPayDetail {
   };
 }
 
-interface PayResponse {
+interface MppRequestDetail {
+  type?: string;
+  paymentMethods?: string[];
+  intents?: string[];
+}
+
+interface CredentialResponse {
   approved: boolean;
-  authorization?: string;
+  credential?: string;
   error?: string;
 }
 
+const SUPPORTED_PAYMENT_METHODS = ['lightning'] as const;
+const SUPPORTED_INTENTS = ['charge'] as const;
+const MPP_EXTENSION_EVENT = 'mpp:extension';
+
 const announcement = {
+  type: 'response',
   name: 'TIPT',
   version: '0.0.1',
-  // 'charge' = pays a BOLT11 Lightning invoice; 'spark-transfer' = sends
-  // sats to a Spark address via wallet.transfer (off-Lightning settlement).
-  // Both flow through the same mpp:payRequest event — the extension picks
-  // the path from the prefix of the `invoice` field.
-  capabilities: ['charge', 'spark-transfer'],
+  // TIPT advertises Lightning charge-only support on the discovery surface.
+  paymentMethods: SUPPORTED_PAYMENT_METHODS,
+  intents: SUPPORTED_INTENTS,
 };
 
 // Cached result of the most recent background "is the wallet configured?"
-// check. Pages that fire `mpp:request` in rapid succession (or that the
+// check. Pages that fire `mpp:extension` request events in rapid succession
+// (or that the
 // throttle below short-circuits) get this cached value immediately rather
 // than waiting a second round-trip. `undefined` means "we haven't asked
 // the background yet" — surfaced to the page as `undefined` so consumers
 // can distinguish "unknown" from "definitely missing".
 let cachedWalletConfigured: boolean | undefined;
+let cachedRequestedPaymentMethods: string[] | undefined;
+let cachedRequestedIntents: string[] | undefined;
+
+function takePaymentMethods(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const methods = value
+    .filter((m): m is string => typeof m === 'string' && m.length > 0 && m.length <= MAX_SHORT_FIELD_LEN)
+    .map((m) => m.toLowerCase());
+  if (methods.length === 0) return undefined;
+  return Array.from(new Set(methods));
+}
+
+function takeIntents(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const intents = value
+    .filter((i): i is string => typeof i === 'string' && i.length > 0 && i.length <= MAX_SHORT_FIELD_LEN)
+    .map((i) => i.toLowerCase());
+  if (intents.length === 0) return undefined;
+  return Array.from(new Set(intents));
+}
+
+function supportsRequested(requested: string[] | undefined, supported: readonly string[]): boolean {
+  if (!requested || requested.length === 0) return true;
+  return requested.every((value) => supported.includes(value));
+}
 
 function dispatchAnnouncement(): void {
-  window.dispatchEvent(new CustomEvent('mpp:response', {
-    detail: { ...announcement, walletConfigured: cachedWalletConfigured },
+  window.dispatchEvent(new CustomEvent(MPP_EXTENSION_EVENT, {
+    detail: {
+      ...announcement,
+      walletConfigured: cachedWalletConfigured,
+      requestedPaymentMethods: cachedRequestedPaymentMethods,
+      requestedIntents: cachedRequestedIntents,
+      supportsRequestedPaymentMethods: supportsRequested(
+        cachedRequestedPaymentMethods,
+        SUPPORTED_PAYMENT_METHODS,
+      ),
+      supportsRequestedIntents: supportsRequested(
+        cachedRequestedIntents,
+        SUPPORTED_INTENTS,
+      ),
+    },
   }));
 }
 
@@ -102,7 +150,7 @@ function takeBoundedString(v: unknown, maxLen: number): string | undefined {
   return isBoundedString(v, maxLen) ? v : undefined;
 }
 
-function takePaymentChallenge(raw: unknown): MppPayDetail['paymentChallenge'] | undefined {
+function takePaymentChallenge(raw: unknown): MppExtChallengeDetail['challenge'] | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const c = raw as Record<string, unknown>;
   const id = takeBoundedString(c.id, MAX_SHORT_FIELD_LEN);
@@ -117,22 +165,29 @@ function takePaymentChallenge(raw: unknown): MppPayDetail['paymentChallenge'] | 
 }
 
 // Announce presence and notify background (icon badge) when the page asks.
-// Rate-limit so a hostile page cannot spam `mpp:request` and keep the SW
+// Rate-limit so a hostile page cannot spam `mpp:extension` request events and
+// keep the SW
 // awake. 250ms is loose enough to feel instant on a real page load and
 // tight enough to throttle a tight dispatch loop.
 //
 // Two announcements happen per "fresh" request:
-//   1. An immediate `mpp:response` carrying the cached `walletConfigured`
+//   1. An immediate `mpp:extension` response carrying the cached
+//      `walletConfigured`
 //      value (possibly `undefined` on the very first request) so pages
 //      that listen with a `once: true` handler still receive a discovery
 //      response without waiting on a runtime hop.
-//   2. A second `mpp:response` after the background reports the current
+//   2. A second `mpp:extension` response after the background reports the
+//      current
 //      wallet-configured state. Pages that care about accuracy should
-//      listen for `mpp:response` continuously (not with `once: true`)
+//      listen for `mpp:extension` continuously (not with `once: true`)
 //      and use the most recent payload.
 const MPP_REQUEST_THROTTLE_MS = 250;
 let lastMppRequestAt = 0;
-window.addEventListener('mpp:request', () => {
+window.addEventListener(MPP_EXTENSION_EVENT, (event: Event) => {
+  const detail = (event as CustomEvent<MppRequestDetail>).detail;
+  if (!detail || detail.type !== 'request') return;
+  cachedRequestedPaymentMethods = takePaymentMethods(detail?.paymentMethods);
+  cachedRequestedIntents = takeIntents(detail?.intents);
   const now = Date.now();
   if (now - lastMppRequestAt >= MPP_REQUEST_THROTTLE_MS) {
     lastMppRequestAt = now;
@@ -156,19 +211,19 @@ window.addEventListener('mpp:request', () => {
 });
 
 // Handle payment requests dispatched by the page.
-window.addEventListener('mpp:payRequest', (event: Event) => {
-  const detail = (event as CustomEvent<MppPayDetail>).detail;
+window.addEventListener('mpp:challenge', (event: Event) => {
+  const detail = (event as CustomEvent<MppExtChallengeDetail>).detail;
   const requestId = takeBoundedString(detail?.requestId, MAX_REQUEST_ID_LEN);
   const invoice = takeBoundedString(detail?.invoice, MAX_INVOICE_LEN);
   if (!requestId || !invoice) {
-    log('[TIPT-CS] mpp:payRequest rejected: missing/invalid requestId or invoice');
+    log('[TIPT-CS] mpp:challenge rejected: missing/invalid requestId or invoice');
     return;
   }
 
   const scheme = takeBoundedString(detail.scheme, MAX_SHORT_FIELD_LEN) ?? 'L402';
   const macaroon = takeBoundedString(detail.macaroon, MAX_OPAQUE_LEN);
   const token = takeBoundedString(detail.token, MAX_OPAQUE_LEN);
-  const paymentChallenge = takePaymentChallenge(detail.paymentChallenge);
+  const challenge = takePaymentChallenge(detail.challenge);
 
   // Sanitise the optional amountSats. Validation that it's required (for
   // Spark) and matches the target kind happens in the background — keeping
@@ -183,9 +238,9 @@ window.addEventListener('mpp:payRequest', (event: Event) => {
     amountSats = detail.amountSats;
   }
 
-  log('[TIPT-CS] mpp:payRequest received, requestId:', requestId);
+  log('[TIPT-CS] mpp:challenge received, requestId:', requestId);
 
-  void sendRuntimeMessage<PayResponse>({
+  void sendRuntimeMessage<CredentialResponse>({
     type: PAY_REQUEST_402,
     payload: {
       source: 'mpp',
@@ -197,25 +252,25 @@ window.addEventListener('mpp:payRequest', (event: Event) => {
         amountSats,
         macaroon,
         token,
-        paymentChallenge,
+        paymentChallenge: challenge,
       },
     },
   })
     .then((response) => {
-      log('[TIPT-CS] Payment response:', response);
-      window.dispatchEvent(new CustomEvent('mpp:payResponse', {
+      log('[TIPT-CS] Credential response:', response);
+      window.dispatchEvent(new CustomEvent('mpp:credential', {
         detail: {
           requestId,
           approved: response.approved,
-          authorization: response.authorization,
+          credential: response.credential,
           error: response.error,
         },
       }));
     })
     .catch((error: unknown) => {
       const message = error instanceof Error ? error.message : 'Payment failed.';
-      log('[TIPT-CS] Payment error:', message);
-      window.dispatchEvent(new CustomEvent('mpp:payResponse', {
+      log('[TIPT-CS] Credential error:', message);
+      window.dispatchEvent(new CustomEvent('mpp:credential', {
         detail: { requestId, approved: false, error: message },
       }));
     });

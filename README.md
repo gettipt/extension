@@ -1,6 +1,6 @@
-# TIPT (The Instant Payment Toolkit)
+# TIPT (The Instant Payment Tool)
 
-This project is a simplified Spark Network Bitcoin Lightning wallet built as a Chrome extension popup using React + TypeScript + Tailwind + Vite.
+TIPS is a simplified lightning wallet built as a Chrome extension.
 
 Core flows included in this MVP:
 - Set up and unlock with a 6-digit PIN
@@ -48,9 +48,9 @@ Build output is generated at:
 dist/extension/
 ```
 
-## TIPT Lightning MPP SDK (client-side)
+## MPP Lightning Extension SDK (client-side)
 
-This repo now includes a browser-side SDK wrapper that extends the Lightning MPP client flow and routes 402 payment approval through the TIPT extension automatically.
+This repo now includes a browser-side SDK wrapper that extends the Lightning MPP client flow and routes 402 payment approval through the compatible extension automatically.
 
 ```ts
 import { createTiptLightningClient } from './src/sdk'
@@ -64,8 +64,9 @@ const response = await tipt.fetch('https://api.example.com/paid-endpoint')
 
 Behavior:
 - Intercepts `402` responses via `Mppx.create`.
-- Converts Lightning `Payment` challenge fields into TIPT `mpp:payRequest`.
-- Receives `mpp:payResponse.authorization` from TIPT and retries the original request automatically.
+- Probes for extension with `mpp:extension` (`type: 'request'`) including `paymentMethods: ['lightning']` and `intents: ['charge']`.
+- Converts Lightning `Payment` challenge fields into TIPT `mpp:challenge`.
+- Receives `mpp:credential.credential` from extension and retries the original request automatically.
 
 ## Load in Chrome as an Extension
 

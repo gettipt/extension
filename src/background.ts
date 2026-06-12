@@ -464,7 +464,7 @@ function requestSparkTransferFromOffscreen(
 // top-right anchoring.
 
 // Collapses concurrent no-wallet 402 requests onto a single setup window and
-// a shared completion promise, so a page firing several payRequests doesn't
+// a shared completion promise, so a page firing several challenge requests doesn't
 // spawn a stack of onboarding windows.
 let walletSetupWait: Promise<boolean> | null = null;
 
@@ -561,7 +561,7 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
   }
 
   // Classify Lightning vs Spark up-front so all downstream logic (amount
-  // resolution, prompt UI, payment routing, authorization shape) shares
+  // resolution, prompt UI, payment routing, credential shape) shares
   // a single branch decision. Unknown prefixes fail closed — we never
   // try to "guess" which SDK call to use.
   const paymentKind = classifyPaymentTarget(invoice);
@@ -705,12 +705,12 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
         `total=${tAfterPay - tEnter} ms`,
       );
 
-      const authorization = buildAuthorizationValue(payload.challenge, preimage);
-      if (!authorization) {
+      const credential = buildAuthorizationValue(payload.challenge, preimage);
+      if (!credential) {
         return { approved: false, error: 'Missing Payment challenge fields for MPP credential retry.' };
       }
 
-      return { approved: true, authorization };
+      return { approved: true, credential };
     }
 
     // Spark transfer branch. No Lightning preimage exists, so the
@@ -731,7 +731,7 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
       `total=${tAfterPay - tEnter} ms`,
     );
 
-    return { approved: true, authorization: `SparkTransfer ${txId}` };
+    return { approved: true, credential: `SparkTransfer ${txId}` };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to pay invoice.';
     log('[TIPT-BG] Payment failed:', message);
@@ -740,21 +740,21 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
 }
 
 // ---------------------------------------------------------------------------
-// Wallet prewarm (mpp:payRequest → spin up offscreen + SparkWallet SDK)
+// Wallet prewarm (mpp:challenge → spin up offscreen + SparkWallet SDK)
 // ---------------------------------------------------------------------------
 // When a page actually requests a payment, kick off the offscreen document
 // and SparkWallet SDK initialisation in the background so the cold-start
 // cost is paid in parallel with the user reading the confirm popup, rather
 // than serialised onto the critical path between clicking "Approve & Pay"
-// and the page receiving its mpp:payResponse.
+// and the page receiving its mpp:credential.
 //
-// Earlier iterations of this fired on mpp:request (page-load discovery).
+// Discovery now uses mpp:extension with detail.type='request'.
 // That was rejected because:
 //   * Every MPP-aware page visit would cause wallet network activity even
 //     when the user never paid.
 //   * Spark's servers would learn the user's IP on mere page visits rather
 //     than only when a payment is actually requested.
-// Firing on mpp:payRequest keeps Spark's view of the user identical to
+// Firing on mpp:challenge keeps Spark's view of the user identical to
 // today (they only see traffic when there's a real payment in flight),
 // while still getting the parallelism win.
 //
@@ -762,7 +762,7 @@ async function handle402PaymentRequest(rawPayload: unknown, sender: chrome.runti
 //   * If the user *declines* the confirm popup, the SDK init was wasted
 //     work. Acceptable — the SDK stays cached for subsequent payments and
 //     declined-after-prompt is the minority case anyway.
-//   * If the wallet is locked when the payRequest arrives, prewarm fails
+//   * If the wallet is locked when the challenge arrives, prewarm fails
 //     silently (we cannot unlock for them) — the confirm popup is shown
 //     anyway and the actual pay step will surface the locked error.
 let prewarmInflight = false;
@@ -813,7 +813,7 @@ type MessageHandler = (
 
 const handlers: Record<string, MessageHandler> = {
   [MSG.MPP_REQUEST_TRIGGERED](_message, sender, sendResponse) {
-    log('[TIPT-BG] mpp:request listener trigger received');
+    log('[TIPT-BG] mpp:extension request listener trigger received');
     const tabId = sender.tab?.id;
     if (tabId === undefined) {
       sendResponse({ ok: true, walletConfigured: false });
@@ -831,7 +831,7 @@ const handlers: Record<string, MessageHandler> = {
         walletConfigured = typeof walletRaw === 'string' && walletRaw.length > 0;
       } catch {
         // Treat storage failure as "no wallet" rather than failing the
-        // discovery handshake — pages can still call mpp:payRequest and
+        // discovery handshake — pages can still call mpp:challenge and
         // surface the eventual failure to the user.
       }
 
@@ -842,7 +842,7 @@ const handlers: Record<string, MessageHandler> = {
       let badgePromise: Promise<void> | Promise<unknown> = Promise.resolve();
       if (walletConfigured) {
         // Clear any prior attention badge — the user may have just finished
-        // creating/restoring their wallet since the last mpp:request on
+        // creating/restoring their wallet since the last mpp:extension request on
         // this tab and we want to drop the orange dot immediately.
         badgePromise = chrome.action
           .setBadgeText({ tabId, text: '' })

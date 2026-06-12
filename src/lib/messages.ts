@@ -35,7 +35,7 @@ export const MSG = {
   // Fire-and-forget warm-up: spin up the offscreen SparkWallet SDK ahead of
   // any actual 402 confirm, so the user doesn't pay the cold-start cost on
   // the critical path between clicking Approve and the page receiving its
-  // mpp:payResponse.
+  // mpp:credential.
   PREWARM_WALLET: 'TIPT_PREWARM_WALLET',
 
   // 402 / MPP background ops

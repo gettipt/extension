@@ -124,43 +124,52 @@ TIPT does not inject scripts or intercept network traffic. Instead, websites exp
 > **Build constraint:** Content scripts in Manifest V3 are loaded as **classic scripts, not ES modules** — `import` statements at the top of `content.ts` would cause a syntax error in the page. `src/content.ts` therefore inlines its own debug-logger and **must not import from any other module**. The popup, background, and offscreen entries are all module-loaded and may import freely.
 
 ### Wallet Advertisement
-TIPT only announces itself when asked. When the page dispatches `mpp:request`, the content script responds with `mpp:response` and also notifies the background to set the toolbar icon for that tab. When **no wallet is configured**, the background additionally paints an orange `!` badge on the icon to draw the user's attention so they know they need to open the extension and create or restore one before the site's payment will succeed.
+TIPT only announces itself when asked. The page and extension use a single discovery event, `mpp:extension`, and distinguish direction by `detail.type` (`'request'` from the page, `'response'` from TIPT). TIPT also notifies the background to set the toolbar icon for that tab. When **no wallet is configured**, the background additionally paints an orange `!` badge on the icon to draw the user's attention so they know they need to open the extension and create or restore one before the site's payment will succeed.
 
 ```js
-// Site asks if a wallet is present
-window.dispatchEvent(new CustomEvent('mpp:request'));
+// Site asks if a wallet is present and declares desired methods + intents
+window.dispatchEvent(new CustomEvent('mpp:extension', {
+  detail: { type: 'request', paymentMethods: ['lightning'], intents: ['charge'] }
+}));
 
 // TIPT responds
-window.addEventListener('mpp:response', (e) => {
+window.addEventListener('mpp:extension', (e) => {
+  if (e.detail?.type !== 'response') return;
   console.log(e.detail);
   // {
+  //   type: 'response',
   //   name: 'TIPT',
   //   version: '0.0.1',
-  //   capabilities: ['charge', 'spark-transfer'],
+  //   intents: ['charge'],
+  //   paymentMethods: ['lightning'],
+  //   requestedIntents: ['charge'],
+  //   requestedPaymentMethods: ['lightning'],
+  //   supportsRequestedIntents: true,
+  //   supportsRequestedPaymentMethods: true,
   //   walletConfigured: true | false | undefined,
   // }
 });
 ```
 
-The two capability tokens correspond to the two payment branches the extension can fulfil:
-- `charge` — pay a BOLT11 Lightning invoice via `wallet.payLightningInvoice`.
-- `spark-transfer` — send sats to a Spark address via `wallet.transfer` ([Spark docs: addressing](https://docs.spark.money/wallets/addressing#spark-addresses), [transfer-bitcoin](https://docs.spark.money/wallets/transfer-bitcoin)).
+The extension advertises Lightning-only support in discovery:
+- `intents: ['charge']`
+- `paymentMethods: ['lightning']`
 
-Both flow through the same `mpp:payRequest` event — the extension picks the branch by inspecting the prefix of the wire `invoice` field (see *Payment kinds* below).
+Payments flow through the same `mpp:challenge` event.
 
 `walletConfigured` reports whether the user has set up a wallet in the extension yet — i.e., whether `chrome.storage` holds an encrypted wallet blob under `WALLET_KEY`. Sites can use this to render a friendlier "set up your wallet first" hint instead of letting the payment fail at the confirm step. Two notes:
 
-- The first `mpp:response` on a page may arrive with `walletConfigured: undefined` because the content script dispatches an immediate announcement *before* it has finished asking the background. As soon as the background replies, the content script dispatches a second `mpp:response` with the resolved value (but only if it differs from the cached value — so steady-state pages still see exactly one event per request). Pages that care about the field should register a continuous listener, not a `once: true` listener.
-- The toolbar icon swap is **per tab**, so the orange badge only appears on tabs that have actually advertised an MPP request. Once the user creates a wallet, the next `mpp:request` from a given tab clears that tab's badge.
+- The first `mpp:extension` response on a page may arrive with `walletConfigured: undefined` because the content script dispatches an immediate announcement *before* it has finished asking the background. As soon as the background replies, the content script dispatches a second `mpp:extension` response with the resolved value (but only if it differs from the cached value — so steady-state pages still see exactly one event per request). Pages that care about the field should register a continuous listener, not a `once: true` listener.
+- The toolbar icon swap is **per tab**, so the orange badge only appears on tabs that have actually advertised an MPP discovery request. Once the user creates a wallet, the next `mpp:extension` request from a given tab clears that tab's badge.
 
-> **Note:** Always register the `mpp:response` listener before dispatching `mpp:request`, since CustomEvents are synchronous.
+> **Note:** Always register the `mpp:extension` listener before dispatching the `type: 'request'` event, since CustomEvents are synchronous.
 
 ### Payment Request
-The site dispatches `mpp:payRequest` with the payment target and (for Spark transfers) the amount. TIPT settles the payment and dispatches `mpp:payResponse` with the resulting `Authorization` header value.
+The site dispatches `mpp:challenge` with the payment target and (for Spark transfers) the amount. TIPT settles the payment and dispatches `mpp:credential` with the resulting credential value.
 
 ```js
 // Site requests payment
-window.dispatchEvent(new CustomEvent('mpp:payRequest', {
+window.dispatchEvent(new CustomEvent('mpp:challenge', {
   detail: {
     requestId: 'unique-id',        // Correlated in the response
     invoice: 'lnbc...',            // BOLT11 invoice OR Spark address ('spark1…' / 'sp1…') (required)
@@ -168,15 +177,15 @@ window.dispatchEvent(new CustomEvent('mpp:payRequest', {
     scheme: 'L402',                // Optional: 'L402' | 'Payment' | 'SparkTransfer' | other
     macaroon: '...',               // Optional: for L402
     token: '...',                  // Optional
-    paymentChallenge: {            // Optional: for Payment/MPP scheme
+    challenge: {                   // Optional: for Payment/MPP scheme
       id, realm, method, intent, request, expires?, opaque?
     }
   }
 }));
 
 // Site listens for the result
-window.addEventListener('mpp:payResponse', (e) => {
-  const { requestId, approved, authorization, error } = e.detail;
+window.addEventListener('mpp:credential', (e) => {
+  const { requestId, approved, credential, error } = e.detail;
   if (approved) {
     // Retry the original request with the Authorization header
   }
@@ -190,8 +199,8 @@ The wire field is named `invoice` for back-compatibility with sites already inte
 `src/sdk/tipt-lightning-mpp-client.ts` provides `createTiptLightningClient()`, a wrapper built on top of `@buildonspark/lightning-mpp-sdk` + `mppx` client primitives:
 
 1. Intercepts HTTP `402` responses through `Mppx.create`.
-2. Reads the `lightning/charge` challenge and dispatches `mpp:payRequest` to TIPT.
-3. Waits for `mpp:payResponse` and uses the returned `authorization` value as the retry credential.
+2. Reads the `lightning/charge` challenge and dispatches `mpp:challenge` to TIPT.
+3. Waits for `mpp:credential` and uses the returned `credential` value as the retry credential.
 4. Automatically retries the original request with `Authorization: <credential>`.
 
 This keeps website integration aligned with MPP challenge semantics while preserving TIPT as the payment-authority UX and wallet execution surface.
@@ -208,7 +217,7 @@ TIPT discriminates payment targets via `src/lib/payment-target.ts`. The classifi
 
 The Spark prefix list mirrors the SDK's `AddressNetwork` + `LegacyAddressNetwork` constants. Spark invoices issued via `createSatsInvoice` share the same prefix family (they encode additional invoice fields inside the bech32m payload but the prefix bytes are identical), so they route through the same branch.
 
-For Spark transfers there is no Lightning preimage and no L402 macaroon, so `buildAuthorizationValue` does not apply. The background returns `authorization: 'SparkTransfer <id>'` — purely informational for the current MPP demo; a real-world consumer would specify its own verification scheme on top of the Spark transfer id.
+For Spark transfers there is no Lightning preimage and no L402 macaroon, so `buildAuthorizationValue` does not apply. The background returns `credential: 'SparkTransfer <id>'` — purely informational for the current MPP demo; a real-world consumer would specify its own verification scheme on top of the Spark transfer id.
 
 ### Supported challenge schemes
 
@@ -221,18 +230,18 @@ For Spark transfers there is no Lightning preimage and no L402 macaroon, so `bui
 The `Payment` credential echoes the challenge fields and embeds the preimage, serialized using **RFC 8785 JSON Canonicalization Scheme (JCS)** and base64url-encoded.
 
 ### Approval flow
-1. Site dispatches `mpp:payRequest` with invoice and challenge details.
-2. Content script forwards to the background service worker as `TIPT_402_PAY_REQUEST` with `source: 'mpp'`. The background derives the request host from `sender.url` (the browser-attested URL of the dispatching frame), never from the page-supplied `payload.url`, so a hostile page cannot impersonate a previously-allowlisted host. The content script also rate-limits `mpp:request` advertisements to once per **250 ms** per tab so a hostile page cannot spam the service worker awake by spinning `dispatchEvent`.
+1. Site dispatches `mpp:challenge` with invoice and challenge details.
+2. Content script forwards to the background service worker as `TIPT_402_PAY_REQUEST` with `source: 'mpp'`. The background derives the request host from `sender.url` (the browser-attested URL of the dispatching frame), never from the page-supplied `payload.url`, so a hostile page cannot impersonate a previously-allowlisted host. The content script also rate-limits `mpp:extension` discovery requests to once per **250 ms** per tab so a hostile page cannot spam the service worker awake by spinning `dispatchEvent`.
 3. Background runs `classifyPaymentTarget(invoice)` (see *Payment kinds*). Unknown prefixes are rejected with the `unavailable` error code; the request never enters the prompt/payment path. For Lightning targets the BOLT11 amount is decoded via `src/lib/bolt11.ts` (a minimal HRP regex; the full Spark SDK cannot run inside the MV3 service worker). The decoded amount is required for any auto-approval path — zero-amount or unparseable invoices always prompt. The HRP regex anchors the amount group to `(0|[1-9]\d*)` so non-canonical encodings like `lnbc0001m1…` are rejected up-front. For Spark targets the BOLT11 decoder is bypassed and the payer-supplied `amountSats` becomes authoritative; the request is rejected outright if `amountSats` is missing, non-positive, or non-integer.
-4. **Wallet-setup gate.** Before any auto-approve or prompt, the background checks `getSynced(WALLET_KEY)`. If no wallet is configured, it opens the main extension UI (`index.html`) as a top-right popup window (`chrome.windows.create({ type: 'popup' })`, anchored like the confirm popup) so the user can create or restore a wallet, and waits — via a `chrome.storage.onChanged` listener on `WALLET_KEY` (the encrypted blob is written by `setItemDual` to `local` and best-effort `sync`) — for setup to complete. As soon as the wallet blob lands, the setup window is closed and the approval flow continues normally. Concurrent no-wallet `payRequest`s collapse onto a single setup window and a shared completion promise (`walletSetupWait`). This gate deliberately precedes `tryAutoApprove` so a host the user previously allowlisted can never silently auto-approve into a payment the extension cannot fulfil — the missing wallet would otherwise only surface as an opaque failure at pay time. If the user closes the setup window without finishing, or the shared 5-minute budget (`CONFIRM_TIMEOUT_MS`) elapses, the request is aborted with the `unavailable` error code. A successful setup also re-triggers `prewarmWallet()` so the freshly-created wallet's offscreen SDK starts initialising before the confirm popup resolves.
+4. **Wallet-setup gate.** Before any auto-approve or prompt, the background checks `getSynced(WALLET_KEY)`. If no wallet is configured, it opens the main extension UI (`index.html`) as a top-right popup window (`chrome.windows.create({ type: 'popup' })`, anchored like the confirm popup) so the user can create or restore a wallet, and waits — via a `chrome.storage.onChanged` listener on `WALLET_KEY` (the encrypted blob is written by `setItemDual` to `local` and best-effort `sync`) — for setup to complete. As soon as the wallet blob lands, the setup window is closed and the approval flow continues normally. Concurrent no-wallet challenge requests collapse onto a single setup window and a shared completion promise (`walletSetupWait`). This gate deliberately precedes `tryAutoApprove` so a host the user previously allowlisted can never silently auto-approve into a payment the extension cannot fulfil — the missing wallet would otherwise only surface as an opaque failure at pay time. If the user closes the setup window without finishing, or the shared 5-minute budget (`CONFIRM_TIMEOUT_MS`) elapses, the request is aborted with the `unavailable` error code. A successful setup also re-triggers `prewarmWallet()` so the freshly-created wallet's offscreen SDK starts initialising before the confirm popup resolves.
 5. Background calls `tryAutoApprove(host, amountSats)` (see *Allowlist*). When the host has caps that permit the payment, it atomically debits `spentToday` and proceeds without prompting.
 6. Otherwise, the background opens a dedicated **confirm popup window** (`confirm.html`) via `chrome.windows.create({ type: 'popup', width: 380, height: 320 })`. Those dimensions are only the *initial* size — `ConfirmApp` runs `useAutoResizeWindow`, which uses a `ResizeObserver` on the root container plus `chrome.windows.update` to size the window so its inner content area exactly matches the rendered DOM (no vertical or horizontal scrollbar) and to re-anchor the right edge so the popup stays glued to the top-right corner as the optional cap field expands/collapses. The popup is positioned at the top-right of the currently focused normal browser window (computed from `chrome.windows.getLastFocused({ windowTypes: ['normal'] })` with a 16 px margin) so it appears in the same place as the in-page toasts from extensions like Honey or Rakuten rather than wherever Chrome would place an unpositioned popup. If the lookup fails the popup falls back to Chrome's default placement. Pending request details — `{ host, url, method, invoice, amountSats, expiresAt, paymentKind }` — are written to `chrome.storage.session` under `tipt_pending_confirm_<id>` and the in-memory promise resolver is kept in a `Map<id, PendingConfirm>` keyed by `crypto.randomUUID()`. The created `window.id` is also tracked in `confirmWindowToId: Map<number, string>` so a `chrome.windows.onRemoved` listener can resolve the pending entry as *declined* the instant the user closes the popup with the [X] button (instead of waiting for the 5-minute alarm to free the host's confirm slot).
 7. The confirm popup renders `ConfirmApp` (`src/ConfirmApp.tsx`) and reads the request details directly from `chrome.storage.session` (no round-trip to the service worker is required). It relies on the popup window's own title bar (`TIPT — Approve Payment`) for the heading and shows: a *Method* badge ("Lightning — BOLT11 invoice" or "Spark — off-Lightning transfer", color-coded), *Site* (host), *Amount* (sats), and — for Spark transfers only — a truncated *Recipient* address (mono, first 14 + last 8 chars; full address available via the row's `title=` tooltip). The raw HTTP request line and the BOLT11 invoice / Spark address are not surfaced in their entirety in the UI by default — they remain in `chrome.storage.session` for the background's own use. An "Auto-approve future payments from this site, up to the daily cap below" checkbox reveals a single *Max per day (sats)* input (default 2× the current amount, low enough that runaway approvals are bounded in single-digit transactions). The collected daily cap is sent as both `maxSatsPerPayment` and `maxSatsPerDay` in `TIPT_402_CONFIRM_RESPONSE`, so a single number is the only constraint on subsequent auto-approvals. Auto-approve is only offered when `amountSats` is known (always true for Spark transfers, conditional on a parseable BOLT11 HRP amount for Lightning).
 8. The popup sends `TIPT_402_CONFIRM_RESPONSE` with `{ id, approved, remember, caps? }` and closes itself **only after** the message has been acknowledged. If `chrome.runtime.sendMessage` throws (e.g., the service worker was recycled between the user clicking Approve and the message dispatch) or the background returns `{ ok: false }`, `ConfirmApp` surfaces the error in the popup and keeps the window open so the user can retry rather than silently losing the approval and waiting for the 5-minute timeout. The background's onMessage handler restricts acceptance to messages whose `sender.url` starts with the extension's own `confirm.html`. The shared `PENDING_CONFIRM_PREFIX` / `pendingConfirmStorageKey(id)` / `PersistedConfirmDetails` definitions live in `src/lib/confirm-protocol.ts` so the popup and worker cannot drift on the storage key prefix or payload shape.
 9. If the user does not respond, the background **auto-declines after 5 minutes**. Expiry is enforced by `chrome.alarms` (`tipt-confirm-<id>`) so the timer survives service worker restarts. The alarm handler resolves any in-memory pending entry and removes the `tipt_pending_confirm_<id>` session-storage record.
-10. On approval, the background settles the payment via the offscreen document. **Lightning** targets go through `TIPT_OFFSCREEN_PAY_INVOICE` and return a Lightning preimage which is fed into `buildAuthorizationValue` to produce an `L402`/`Payment`/`Bearer` `Authorization` header. **Spark** targets go through `TIPT_OFFSCREEN_SPARK_TRANSFER` (which calls `wallet.transfer({ amountSats, receiverSparkAddress })`) and return a Spark transfer id, returned as `authorization: 'SparkTransfer <id>'`. When `remember` is set and `amountSats > 0`, the background persists the host + caps via `rememberHost(host, { maxSatsPerPayment, maxSatsPerDay, initialSpentSats: amountSats })`. The `Authorization` builder, JCS canonicaliser, base64url encoder, and opaque-decoder live in `src/lib/auth-credentials.ts` (separated from `background.ts` to keep the service-worker entry focused on orchestration).
+10. On approval, the background settles the payment via the offscreen document. **Lightning** targets go through `TIPT_OFFSCREEN_PAY_INVOICE` and return a Lightning preimage which is fed into `buildAuthorizationValue` to produce an `L402`/`Payment`/`Bearer` `Authorization` header. **Spark** targets go through `TIPT_OFFSCREEN_SPARK_TRANSFER` (which calls `wallet.transfer({ amountSats, receiverSparkAddress })`) and return a Spark transfer id, returned as `credential: 'SparkTransfer <id>'`. When `remember` is set and `amountSats > 0`, the background persists the host + caps via `rememberHost(host, { maxSatsPerPayment, maxSatsPerDay, initialSpentSats: amountSats })`. The `Authorization` builder, JCS canonicaliser, base64url encoder, and opaque-decoder live in `src/lib/auth-credentials.ts` (separated from `background.ts` to keep the service-worker entry focused on orchestration).
 11. **All error strings returned to the page are first mapped to one of four opaque codes** — `'declined' | 'unavailable' | 'locked' | 'failed'` — via `sanitise402Error`. The site therefore learns success/failure plus a coarse category and cannot fingerprint internal wallet state (locked vs. uninitialised vs. SDK-specific error). Internal `[TIPT-BG]` logs still capture the full message for developer diagnostics.
-12. Content script dispatches `mpp:payResponse` back to the page.
+12. Content script dispatches `mpp:credential` back to the page.
 13. Site retries its original request with the `Authorization` header.
 
 > The previous design used `window.confirm()` inside the content script (via a `TIPT_PROMPT_402_PAYMENT` message). That path has been removed. The earlier `TIPT_402_CONFIRM_READY` round-trip used by the confirm popup to fetch its display details was also removed in favour of a direct `chrome.storage.session` read.
@@ -288,10 +297,9 @@ The `Payment` credential echoes the challenge fields and embeds the preimage, se
        │                                          │  Content Script│
        │                                          │  (content.ts)  │  CustomEvents (mpp:*)
        │                                          └───────┬────────┘
-       │                                                  │ mpp:response    (TIPT → page)
-       │                                                  │ mpp:request     (page → TIPT)
-       │                                                  │ mpp:payRequest  (page → TIPT)
-       │                                                  │ mpp:payResponse (TIPT → page)
+       │                                                  │ mpp:extension   (page ⇄ TIPT, type=request/response)
+       │                                                  │ mpp:challenge    (page → TIPT)
+       │                                                  │ mpp:credential   (TIPT → page)
        │                                                Page JS
        │
        └─── src/lib/ ─── storage, wallet-client (ensureOffscreen, sendWalletMessage,
@@ -378,7 +386,7 @@ src/
 ├── background.ts           # MV3 service worker, 402 orchestration, allowlist caps, confirm window mgmt
 ├── confirm.tsx             # confirm.html entry point (uses `bootstrap()`)
 ├── constants.ts            # Storage keys, PIN policy, PinAttemptsState interface
-├── content.ts              # MPP CustomEvent bridge (mpp:request / mpp:payRequest / mpp:payResponse)
+├── content.ts              # MPP CustomEvent bridge (mpp:extension / mpp:challenge / mpp:credential)
 ├── crypto.ts               # PBKDF2 (default 600k, legacy 100k) + AES-GCM helpers
 ├── lnurl.ts                # LNURL resolve + safe-URL guard (https only, no private hosts)
 ├── main.tsx                # index.html entry point (uses `bootstrap()`)
@@ -460,8 +468,8 @@ src/
 - **Per-host caps with daily reset** — `tryAutoApprove` requires a successfully-decoded invoice amount and enforces `maxSatsPerPayment` plus a UTC-day `maxSatsPerDay` cap, with the running counter persisted to `chrome.storage.local`. Zero-amount or unparseable invoices always prompt.
 - **Confirm popup sender check** — `TIPT_402_CONFIRM_RESPONSE` is only accepted when the sender URL starts with the extension's own `confirm.html`, so a content script that happens to share the same extension origin cannot spoof user approvals.
 - **JCS hardened** — the RFC 8785 canonicaliser throws on non-finite numbers, `Symbol` / function values, and other unsupported types instead of silently emitting `null`, so a hostile server cannot trick TIPT into signing a payment credential that the upstream service then validates differently.
-- **Opaque payload validation** — the optional `paymentChallenge.opaque` field is base64url-decoded and parsed as JSON, then validated as a flat `Record<string, string>` with each value ≤1024 chars. Nested objects, arrays, numbers, or oversize strings are rejected — preventing a hostile server from injecting structure into the JCS-signed credential TIPT echoes back.
-- **Page-input length caps** — the content script (`src/content.ts`) rejects `mpp:payRequest` payloads with `invoice` (BOLT11 invoice or Spark address) > 8192 chars, request IDs > 256 chars, opaque blobs > 4096 chars, or any short field (realm, method, intent) > 512 chars. Spark addresses are bounded at 1024 chars by the SDK itself, so the 8192 cap is conservative but harmless. The `amountSats` field, when present, must be a finite positive integer ≤ `Number.MAX_SAFE_INTEGER`. The `bolt11.decodeBolt11AmountSats` helper enforces the same 8192-char cap and a 19-digit amount cap on every decode path.
+- **Opaque payload validation** — the optional `challenge.opaque` field is base64url-decoded and parsed as JSON, then validated as a flat `Record<string, string>` with each value ≤1024 chars. Nested objects, arrays, numbers, or oversize strings are rejected — preventing a hostile server from injecting structure into the JCS-signed credential TIPT echoes back.
+- **Page-input length caps** — the content script (`src/content.ts`) rejects `mpp:challenge` payloads with `invoice` (BOLT11 invoice or Spark address) > 8192 chars, request IDs > 256 chars, opaque blobs > 4096 chars, or any short field (realm, method, intent) > 512 chars. Spark addresses are bounded at 1024 chars by the SDK itself, so the 8192 cap is conservative but harmless. The `amountSats` field, when present, must be a finite positive integer ≤ `Number.MAX_SAFE_INTEGER`. The `bolt11.decodeBolt11AmountSats` helper enforces the same 8192-char cap and a 19-digit amount cap on every decode path.
 - **Manifest-permission minimisation** — `tabs` was removed; `host_permissions` was narrowed from `<all_urls>` to `https://*/*`; content scripts run on `https://*/*` plus `http://localhost/*` and `http://127.0.0.1/*` for local demo testing only (production traffic still requires HTTPS — only the content-script injection match expands).
 - **Wallet secrets in both `chrome.storage.local` and `chrome.storage.sync`** via `setItemDual`. Local is the primary read path (fast); sync exists so a user signed into the same Chrome profile on another device automatically picks up their encrypted wallet. The PIN is required on every device to decrypt — sync only transports the ciphertext.
 - **Mnemonic not retained in React state** after the app reaches `ready`. The backup-download flow re-derives the mnemonic on demand using the cached `CryptoKey`.
@@ -472,8 +480,8 @@ src/
 - **Storage sync-hash integrity** — `setItem` stamps the SHA-256 dedupe hash **after** the `chrome.storage.sync.set` await resolves, not before. A quota / offline failure no longer poisons the dedupe map with a hash that doesn't reflect on-disk state. Likewise, the `chrome.storage.onChanged` listener always *clears* the stale `lastSyncHash[key]` entry on any external sync change — the other context wrote a value we didn't compute the hash for, so the only correct local state is "unknown."
 - **Confirm popup window-close = decline** — closing the confirm popup with the [X] button used to leave the host in the `hostsWithPendingConfirm` set until the 5-minute alarm fired (UX wedge + low-grade DoS on the user's own browsing). A `chrome.windows.onRemoved` listener now resolves the pending entry as declined the instant the window is closed.
 - **ConfirmApp respond() surfaces errors** — `chrome.runtime.sendMessage` failures (e.g., service worker recycled mid-click) used to be swallowed by `finally { window.close() }`, leaving the user thinking they had approved while the awaiting tab silently timed out at 5 minutes. The popup now keeps itself open and shows the error so the user can retry.
-- **`mpp:request` rate limiting** — the content script throttles `mpp:request` advertisements to once per 250 ms per tab, so a hostile page can't spam the service worker awake with a `dispatchEvent` loop.
-- **Sanitised 402 error responses** — every error string returned from `handle402PaymentRequest` is mapped at the background→content boundary to one of four opaque codes (`'declined' | 'unavailable' | 'locked' | 'failed'`) by `sanitise402Error`. A site can no longer fingerprint internal wallet state ("Wallet is locked", "Wallet data not found", SDK internals) from the `mpp:payResponse` event. Internal logs keep the full message.
+- **`mpp:extension` request rate limiting** — the content script throttles `mpp:extension` discovery requests to once per 250 ms per tab, so a hostile page can't spam the service worker awake with a `dispatchEvent` loop.
+- **Sanitised 402 error responses** — every error string returned from `handle402PaymentRequest` is mapped at the background→content boundary to one of four opaque codes (`'declined' | 'unavailable' | 'locked' | 'failed'`) by `sanitise402Error`. A site can no longer fingerprint internal wallet state ("Wallet is locked", "Wallet data not found", SDK internals) from the `mpp:credential` event. Internal logs keep the full message.
 - **Background-side 402 payload revalidation** — `validate402Payload` re-applies the same length / type / required-field caps that `src/content.ts` enforces at the page boundary (invoice ≤ 8192, short fields ≤ 512, opaque ≤ 4096, `amountSats` is a finite positive integer ≤ `Number.MAX_SAFE_INTEGER`, etc.) before anything is fed into the JCS canonicaliser, BOLT11 decoder, payment-target classifier, or the SDK. A future regression in the content script — or a direct internal sender bypass — therefore can't push unbounded strings through the worker.
 - **LNURL trailing-dot normalisation** — `isDisallowedHost` strips a trailing FQDN dot before its `.local` / `.onion` suffix checks, so a hostile LNURL of `https://service.onion./…` (or `https://printer.local./…`) can no longer slip past the private-network guard.
 
@@ -485,7 +493,7 @@ src/
 - **BTC price refresh aborts** in-flight requests on effect cleanup via `AbortController`. The initial fetch is skipped when the persisted cache is < 60 s old, removing one HTTP round-trip from most popup opens.
 - **`loadTransfers` debounced 1500 ms** on balance changes; the longer window collapses the burst of `transfer:claimed` + `deposit:confirmed` + post-send `getBalance` events into one `getTransfers` round-trip per real-world payment.
 - **`pollForPreimage` initial poll at 250 ms**, then exponential backoff to 1 s (was 5 s). Smaller ceiling captures the actual preimage-availability moment within ≤ 1 s of when the SDK exposes it, instead of leaving the user waiting up to ~5 s of pure idle time between an SDK update and the next poll.
-- **Offscreen + SparkWallet SDK prewarm on `mpp:payRequest`** — `handle402PaymentRequest` fires a fire-and-forget `prewarmWallet()` as soon as a valid invoice arrives, in parallel with the auto-approve check and (when needed) the confirm popup. By the time the user clicks **Approve & Pay**, the offscreen document is up and `SparkWallet.initialize` has already run (or is well underway), so the cold-start cost is no longer serialised onto the critical path between the click and the page receiving its `mpp:payResponse`. A `prewarmInflight` guard collapses concurrent calls and `ensureWalletFromBlob` is itself idempotent (returns the cached SDK instance on the second call). Prewarm intentionally does **not** fire on `mpp:request` (page-load discovery), since that would cause wallet network activity — and an IP exposure to the Spark cluster — on every MPP-aware page visit even when the user never pays.
+- **Offscreen + SparkWallet SDK prewarm on `mpp:challenge`** — `handle402PaymentRequest` fires a fire-and-forget `prewarmWallet()` as soon as a valid invoice arrives, in parallel with the auto-approve check and (when needed) the confirm popup. By the time the user clicks **Approve & Pay**, the offscreen document is up and `SparkWallet.initialize` has already run (or is well underway), so the cold-start cost is no longer serialised onto the critical path between the click and the page receiving its `mpp:credential`. A `prewarmInflight` guard collapses concurrent calls and `ensureWalletFromBlob` is itself idempotent (returns the cached SDK instance on the second call). Prewarm intentionally does **not** fire on `mpp:extension` discovery, since that would cause wallet network activity — and an IP exposure to the Spark cluster — on every MPP-aware page visit even when the user never pays.
 - **402 timing logs (DEV builds only)** — `handle402PaymentRequest` and `payInvoice` log per-stage timings: time spent in `tryAutoApprove`, user reaction time in the confirm popup, `ensureOffscreen`, fee-estimate round trip, `payLightningInvoice`, and `pollForPreimage`. Run a 402 flow with `npm run dev` and inspect the service-worker / offscreen consoles to see exactly where any given request spent its wall time.
 - **In-memory storage cache** — `src/lib/storage.ts` caches every read in a `Map<string, string|null>` and invalidates via `chrome.storage.onChanged`. Popup-open flows that touch the same key 5+ times (e.g. `getSynced(WALLET_KEY)`) now hit the disk once.
 - **Hash-deduped sync writes** — identical `chrome.storage.sync.set` calls are SHA-256-deduped and skipped, so chronic re-writes (e.g. allowlist `loadAllowlist` save-on-noop) don't burn through the 120-write-per-minute quota.
@@ -496,7 +504,7 @@ src/
 - **`chrome.storage` is the single source of truth** — no `localStorage` write-through layer.
 - **Spark SDK isolated to offscreen** — popup bundle stays small.
 - **SDK payload serialisation contract** — `getWalletTransfers` runs SDK responses through `normaliseBigints`, which converts `bigint` → decimal string, `Date` → ISO string, `Map`/`Set` → object/array, and passes typed arrays through untouched. Without the `Date` branch every transfer's timestamp would round-trip to `{}` (because `Object.entries(date)` returns `[]`) and the popup would render "Unknown date" for every row.
-- **`mpp:request` handler keeps the SW alive until icon + badge writes resolve** — the background MPP_REQUEST_TRIGGERED handler returns `true` and calls `sendResponse({ok:true, walletConfigured})` once it has finished reading the wallet blob from `chrome.storage` and painting the icon/badge for the tab. Without `return true` Chrome may unload the service worker mid-`await` and silently drop the icon swap when the worker had just spun up to handle this one message. The content script's `chrome.runtime.sendMessage` is wrapped in `.catch(() => {})` to suppress the unhandled-promise warning that fires on host pages when the SW is genuinely unreachable; in that case the page-side cache of `walletConfigured` is left unchanged so the previously-known value still rides along on the immediate `mpp:response`.
+- **`mpp:extension` request handler keeps the SW alive until icon + badge writes resolve** — the background MPP_REQUEST_TRIGGERED handler returns `true` and calls `sendResponse({ok:true, walletConfigured})` once it has finished reading the wallet blob from `chrome.storage` and painting the icon/badge for the tab. Without `return true` Chrome may unload the service worker mid-`await` and silently drop the icon swap when the worker had just spun up to handle this one message. The content script's `chrome.runtime.sendMessage` is wrapped in `.catch(() => {})` to suppress the unhandled-promise warning that fires on host pages when the SW is genuinely unreachable; in that case the page-side cache of `walletConfigured` is left unchanged so the previously-known value still rides along on the immediate `mpp:extension` response.
 
 ---
 

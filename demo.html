@@ -314,7 +314,7 @@
     <div id="responseEmpty" class="empty">No payment sent yet.</div>
     <div id="responseBox" class="response-box" style="display:none">
       <div class="response-header">
-        <span>mpp:payResponse</span>
+        <span>mpp:credential</span>
         <span id="responseBadge" class="badge"></span>
       </div>
       <pre id="responseJson"></pre>
@@ -535,12 +535,15 @@
 
     // ── Wallet status ─────────────────────────────────────────────────────────
     let walletReady = false;
-    window.addEventListener('mpp:response', (e) => {
+    window.addEventListener('mpp:extension', (e) => {
       const detail = e.detail || {};
+      if (detail.type !== 'response') return;
       walletReady = true;
       document.getElementById('statusDot').className = 'status-dot detected';
       document.getElementById('statusText').textContent = `${detail.name || 'Wallet'} detected (v${detail.version || '?'})`;
-      document.getElementById('statusCaps').textContent = (detail.capabilities || []).join(', ');
+      const methods = (detail.paymentMethods || []).join(', ');
+      const intents = (detail.intents || []).join(', ');
+      document.getElementById('statusCaps').textContent = `intents=[${intents}] methods=[${methods}]`;
       const walletEl = document.getElementById('statusWallet');
       if (detail.walletConfigured === true) {
         walletEl.className = 'status-wallet configured';
@@ -553,25 +556,30 @@
         walletEl.textContent = 'Wallet status unknown';
       }
       refreshPayButton();
-      logEvent('mpp:response', `name=${detail.name}, caps=[${(detail.capabilities||[]).join(', ')}], walletConfigured=${detail.walletConfigured}`);
+      logEvent(
+        'mpp:extension',
+        `type=response, name=${detail.name}, intents=[${(detail.intents||[]).join(', ')}], methods=[${(detail.paymentMethods||[]).join(', ')}], walletConfigured=${detail.walletConfigured}`,
+      );
     });
 
     // Surface extension bridge traffic in the event log so the SDK flow is visible.
-    window.addEventListener('mpp:payRequest', (e) => {
+    window.addEventListener('mpp:challenge', (e) => {
       const d = e.detail || {};
       logEvent(
-        'mpp:payRequest',
+        'mpp:challenge',
         `requestId=${String(d.requestId || '?').slice(0, 8)}…, invoice=${String(d.invoice || '').slice(0, 16)}…`,
       );
     });
-    window.addEventListener('mpp:payResponse', (e) => {
+    window.addEventListener('mpp:credential', (e) => {
       const d = e.detail || {};
-      logEvent('mpp:payResponse', `approved=${Boolean(d.approved)}, error=${d.error || 'none'}`);
+      logEvent('mpp:credential', `approved=${Boolean(d.approved)}, error=${d.error || 'none'}`);
     });
 
     // Request announcement on load
-    logEvent('mpp:request', 'dispatched on page load');
-    window.dispatchEvent(new CustomEvent('mpp:request'));
+    logEvent('mpp:extension', 'dispatched discovery request on page load');
+    window.dispatchEvent(new CustomEvent('mpp:extension', {
+      detail: { type: 'request', paymentMethods: ['lightning'], intents: ['charge'] },
+    }));
 
     // ── Live recipient classification + form gating ───────────────────────────
     const recipientInput = document.getElementById('recipient');
