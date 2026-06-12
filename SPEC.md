@@ -72,7 +72,7 @@ The Send panel accepts Lightning Addresses and LNURLs. Both resolve via LNURL-pa
 - Only `https://` URLs are accepted.
 - The hostname must not be a loopback / private / link-local / multicast IPv4 literal, an IPv6 loopback / link-local / unique-local literal, `localhost`, a `.local` / `.localhost` name, or a `.onion` address.
 - The initial LNURL/`.well-known/lnurlp` URL **and** the `callback` URL returned by the server are both validated, so a malicious server cannot redirect TIPT to a private network for the invoice fetch.
-- The `.well-known/lnurlp` JSON response must include `tag === 'payRequest'`. Other LNURL response shapes (`login`, `withdrawRequest`, etc.) are rejected even when they happen to expose a `callback` field — the demo page already did this; the popup now does too.
+- The `.well-known/lnurlp` JSON response must include `tag === 'payRequest'`. Other LNURL response shapes (`login`, `withdrawRequest`, etc.) are rejected even when they happen to expose a `callback` field.
 - The callback URL is composed with `URL` + `URLSearchParams.set('amount', …)` rather than naïve string concatenation, so a `callback` that contains a `#fragment` no longer ends up with `amount=` parsed inside the fragment instead of the query.
 
 ### Send flow
@@ -196,7 +196,7 @@ The wire field is named `invoice` for back-compatibility with sites already inte
 
 ### SDK wrapper for automatic 402 handling
 
-`src/sdk/tipt-lightning-mpp-client.ts` provides `createTiptLightningClient()`, a wrapper built on top of `@buildonspark/lightning-mpp-sdk` + `mppx` client primitives:
+The browser-side wrapper now lives in the external `lightning-mpp-extension-sdk` package and provides `createLightningMppExtensionClient()`, built on top of `@buildonspark/lightning-mpp-sdk` + `mppx` client primitives:
 
 1. Intercepts HTTP `402` responses through `Mppx.create`.
 2. Reads the `lightning/charge` challenge and dispatches `mpp:challenge` to TIPT.
@@ -217,7 +217,7 @@ TIPT discriminates payment targets via `src/lib/payment-target.ts`. The classifi
 
 The Spark prefix list mirrors the SDK's `AddressNetwork` + `LegacyAddressNetwork` constants. Spark invoices issued via `createSatsInvoice` share the same prefix family (they encode additional invoice fields inside the bech32m payload but the prefix bytes are identical), so they route through the same branch.
 
-For Spark transfers there is no Lightning preimage and no L402 macaroon, so `buildAuthorizationValue` does not apply. The background returns `credential: 'SparkTransfer <id>'` — purely informational for the current MPP demo; a real-world consumer would specify its own verification scheme on top of the Spark transfer id.
+For Spark transfers there is no Lightning preimage and no L402 macaroon, so `buildAuthorizationValue` does not apply. The background returns `credential: 'SparkTransfer <id>'` — purely informational for MPP integrations; a real-world consumer would specify its own verification scheme on top of the Spark transfer id.
 
 ### Supported challenge schemes
 
@@ -470,7 +470,7 @@ src/
 - **JCS hardened** — the RFC 8785 canonicaliser throws on non-finite numbers, `Symbol` / function values, and other unsupported types instead of silently emitting `null`, so a hostile server cannot trick TIPT into signing a payment credential that the upstream service then validates differently.
 - **Opaque payload validation** — the optional `challenge.opaque` field is base64url-decoded and parsed as JSON, then validated as a flat `Record<string, string>` with each value ≤1024 chars. Nested objects, arrays, numbers, or oversize strings are rejected — preventing a hostile server from injecting structure into the JCS-signed credential TIPT echoes back.
 - **Page-input length caps** — the content script (`src/content.ts`) rejects `mpp:challenge` payloads with `invoice` (BOLT11 invoice or Spark address) > 8192 chars, request IDs > 256 chars, opaque blobs > 4096 chars, or any short field (realm, method, intent) > 512 chars. Spark addresses are bounded at 1024 chars by the SDK itself, so the 8192 cap is conservative but harmless. The `amountSats` field, when present, must be a finite positive integer ≤ `Number.MAX_SAFE_INTEGER`. The `bolt11.decodeBolt11AmountSats` helper enforces the same 8192-char cap and a 19-digit amount cap on every decode path.
-- **Manifest-permission minimisation** — `tabs` was removed; `host_permissions` was narrowed from `<all_urls>` to `https://*/*`; content scripts run on `https://*/*` plus `http://localhost/*` and `http://127.0.0.1/*` for local demo testing only (production traffic still requires HTTPS — only the content-script injection match expands).
+- **Manifest-permission minimisation** — `tabs` was removed; `host_permissions` was narrowed from `<all_urls>` to `https://*/*`; content scripts run on `https://*/*` plus `http://localhost/*` and `http://127.0.0.1/*` for local integration testing (production traffic still requires HTTPS — only the content-script injection match expands).
 - **Wallet secrets in both `chrome.storage.local` and `chrome.storage.sync`** via `setItemDual`. Local is the primary read path (fast); sync exists so a user signed into the same Chrome profile on another device automatically picks up their encrypted wallet. The PIN is required on every device to decrypt — sync only transports the ciphertext.
 - **Mnemonic not retained in React state** after the app reaches `ready`. The backup-download flow re-derives the mnemonic on demand using the cached `CryptoKey`.
 - **Confirm popup window** replaces the page-level `window.confirm`, so a hostile page cannot suppress, race, or visually spoof the dialog.
@@ -513,7 +513,7 @@ src/
 - **Manifest version**: 3
 - **Permissions**: `storage`, `offscreen`, `alarms`
 - **Host permissions**: `https://*/*` (narrowed from `<all_urls>` so the extension can never run cross-origin requests against `http://`, `file://`, or `chrome-extension://` targets)
-- **Content script**: `content.js` injected at `document_start` on `https://*/*`, plus `http://localhost/*` and `http://127.0.0.1/*` so the bundled `demo.html` is testable via a local dev server (e.g. `vite preview`). 402 payments on the production web still require HTTPS endpoints; the loopback origins are a developer convenience only.
+- **Content script**: `content.js` injected at `document_start` on `https://*/*`, plus `http://localhost/*` and `http://127.0.0.1/*` so local integration pages are testable during development. 402 payments on the production web still require HTTPS endpoints; the loopback origins are a developer convenience only.
 - **Background**: `background.js` module service worker
 - **CSP**: `script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https:; img-src 'self' data:; style-src 'self' 'unsafe-inline'`. WASM eval is required for the Spark SDK in the offscreen document; `wss:` was dropped from `connect-src` after a grep of the built `offscreen.js` confirmed nothing in the bundle uses `new WebSocket(`. LNURL pay requires arbitrary HTTPS reach so `https:` is retained.
 - **Extension pages**: `index.html` (popup, default action), `offscreen.html` (offscreen document), `confirm.html` (per-request 402 approval popup window)
