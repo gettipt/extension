@@ -16,6 +16,23 @@ TIPT is a Lightning wallet Chrome extension.
 - npm 10+
 - Google Chrome
 
+## Build Process
+
+Run from `extension/`:
+
+```bash
+npm install
+npm run dev
+npm run typecheck
+npm run build
+npm run preview
+```
+
+- `dev`: starts Vite in development mode.
+- `typecheck`: runs TypeScript project build checks.
+- `build`: runs typecheck, then creates the production build in `dist/`.
+- `preview`: serves the production build locally.
+
 ## Quickstart
 
 1. Install dependencies:
@@ -27,7 +44,7 @@ npm install
 2. Build the extension:
 
 ```bash
-npm run build:extension
+npm run build
 ```
 
 3. Open Chrome extensions page:
@@ -55,7 +72,7 @@ After any code change:
 1. Rebuild:
 
 ```bash
-npm run build:extension
+npm run build
 ```
 
 2. Return to `chrome://extensions`.
