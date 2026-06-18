@@ -67,11 +67,13 @@ interface CredentialResponse {
 const SUPPORTED_PAYMENT_METHODS = ['lightning'] as const;
 const SUPPORTED_INTENTS = ['charge'] as const;
 const MPP_EXTENSION_EVENT = 'mpp:extension';
+const MPP_EVENT_BRIDGE_PROTOCOL_VERSION = '1.0.0';
 
 const announcement = {
   type: 'response',
   name: 'TIPT',
   version: '0.0.1',
+  protocolVersion: MPP_EVENT_BRIDGE_PROTOCOL_VERSION,
   // TIPT advertises Lightning charge-only support on the discovery surface.
   paymentMethods: SUPPORTED_PAYMENT_METHODS,
   intents: SUPPORTED_INTENTS,
