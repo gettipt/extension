@@ -10,15 +10,7 @@ TIPT is a Lightning wallet Chrome extension.
 - Generates receive invoices (QR + copy).
 - Sends payments via Lightning Address or LNURL.
 
-## Prerequisites
-
-- Node.js 20+
-- pnpm 10+
-- Google Chrome
-
 ## Build Process
-
-Run from `extension/`:
 
 ```bash
 pnpm install
@@ -77,4 +69,3 @@ pnpm run build
 
 2. Return to `chrome://extensions`.
 3. Click Reload on the TIPT extension card.
-

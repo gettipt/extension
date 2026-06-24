@@ -12,8 +12,11 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist/extension',
+    outDir: 'dist',
     emptyOutDir: true,
+    // Offscreen wallet runtime bundles the Spark SDK and is expected to be large.
+    // Keep warnings focused on unexpected growth beyond this known baseline.
+    chunkSizeWarningLimit: 7000,
     rollupOptions: {
       input: {
         main: path.resolve(__dirname, 'index.html'),
