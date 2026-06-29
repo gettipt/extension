@@ -174,7 +174,7 @@ export async function payInvoice(invoice: string, options: PayOptions = {}): Pro
   }
   const tFeeReady = Date.now();
 
-  const result = await wallet.payLightningInvoice({ invoice, maxFeeSats });
+  const result = await wallet.payLightningInvoice({ invoice, maxFeeSats, preferSpark: true });
   const tPayReturned = Date.now();
   const r = result as unknown as Record<string, unknown>;
   const txId = typeof r.id === 'string' ? r.id
